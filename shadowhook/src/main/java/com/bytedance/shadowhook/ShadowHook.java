@@ -24,10 +24,10 @@
 package com.bytedance.shadowhook;
 
 public final class ShadowHook {
-    private static final int ERRNO_OK = 0;
-    private static final int ERRNO_UNINIT = 2;
-    private static final int ERRNO_LOAD_LIBRARY_EXCEPTION = 100;
-    private static final int ERRNO_INIT_EXCEPTION = 101;
+    public static final int ERRNO_OK = 0;
+    public static final int ERRNO_UNINIT = 2;
+    public static final int ERRNO_LOAD_LIBRARY_EXCEPTION = 100;
+    public static final int ERRNO_INIT_EXCEPTION = 101;
 
     private static boolean loaded = false;
     private static boolean inited = false;
@@ -202,6 +202,9 @@ public final class ShadowHook {
                     case FLAGS:
                         itemFlags |= recordItemFlags;
                         break;
+                    case TRACE:
+                        itemFlags |= recordItemTrace;
+                        break;
                     default:
                         break;
                 }
@@ -271,7 +274,7 @@ public final class ShadowHook {
 
     private static native String nativeGetArch();
 
-    private static final int recordItemAll = 0b11111111111;
+    private static final int recordItemAll = -1;  // 0xFFFFFFFF
     private static final int recordItemTimestamp = 1;
     private static final int recordItemCallerLibName = 1 << 1;
     private static final int recordItemOp = 1 << 2;
@@ -283,6 +286,7 @@ public final class ShadowHook {
     private static final int recordItemErrno = 1 << 8;
     private static final int recordItemStub = 1 << 9;
     private static final int recordItemFlags = 1 << 10;
+    private static final int recordItemTrace = 1 << 11;
 
     public enum RecordItem {
         TIMESTAMP,
@@ -295,7 +299,8 @@ public final class ShadowHook {
         BACKUP_LEN,
         ERRNO,
         STUB,
-        FLAGS
+        FLAGS,
+        TRACE
     }
 
     public interface ILibLoader {

@@ -29,7 +29,7 @@
 #include "sh_trampo.h"
 
 #define SH_ENTER_ANON_PAGE_NAME "shadowhook-enter"
-#define SH_ENTER_DELAY_SEC      10
+#define SH_ENTER_DELAY_SEC      15
 
 #ifdef SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND
 #define SH_ENTER_SZ 256

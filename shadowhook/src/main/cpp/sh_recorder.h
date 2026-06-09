@@ -25,25 +25,36 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define SH_RECORDER_OP_HOOK_INSTR_ADDR      0
-#define SH_RECORDER_OP_HOOK_FUNC_ADDR       1
-#define SH_RECORDER_OP_HOOK_SYM_ADDR        2
-#define SH_RECORDER_OP_HOOK_SYM_NAME        3
-#define SH_RECORDER_OP_UNHOOK               4
-#define SH_RECORDER_OP_INTERCEPT_INSTR_ADDR 5
-#define SH_RECORDER_OP_INTERCEPT_FUNC_ADDR  6
-#define SH_RECORDER_OP_INTERCEPT_SYM_ADDR   7
-#define SH_RECORDER_OP_INTERCEPT_SYM_NAME   8
-#define SH_RECORDER_OP_UNINTERCEPT          9
+#define SH_RECORDER_OP_HOOK_INSTR_ADDR         0
+#define SH_RECORDER_OP_HOOK_FUNC_ADDR          1
+#define SH_RECORDER_OP_HOOK_SYM_ADDR           2
+#define SH_RECORDER_OP_HOOK_SYM_NAME           3
+#define SH_RECORDER_OP_UNHOOK                  4
+#define SH_RECORDER_OP_INTERCEPT_INSTR_ADDR    5
+#define SH_RECORDER_OP_INTERCEPT_FUNC_ADDR     6
+#define SH_RECORDER_OP_INTERCEPT_SYM_ADDR      7
+#define SH_RECORDER_OP_INTERCEPT_SYM_NAME      8
+#define SH_RECORDER_OP_UNINTERCEPT             9
+#define SH_RECORDER_OP_HOOK_INVISIBLE_SYM_ADDR 10
 
 bool sh_recorder_get_recordable(void);
 void sh_recorder_set_recordable(bool recordable);
 
+typedef struct {
+  char buf[512];
+  size_t size;
+  size_t backup_len;
+  size_t elf_info_recorded;
+} sh_recorder_trace_t;
+#define SH_RECORDER_TRACE_INITIALIZER {{'\0'}, 0, 0, 0}
+void sh_recorder_trace_append(sh_recorder_trace_t *trace, const char *format, ...);
+void sh_recorder_trace_backup_len(sh_recorder_trace_t *trace, size_t backup_len);
+
 int sh_recorder_add_op(int error_number, uint8_t op, uintptr_t sym_addr, const char *lib_name,
-                       const char *sym_name, uintptr_t new_addr, uint32_t flags, size_t backup_len,
-                       uintptr_t stub, uintptr_t caller_addr, const char *caller_lib_name);
+                       const char *sym_name, uintptr_t new_addr, uint32_t flags, uintptr_t stub,
+                       uintptr_t caller_addr, const char *caller_lib_name, sh_recorder_trace_t *trace);
 int sh_recorder_add_unop(int error_number, uint8_t op, uintptr_t stub, uintptr_t caller_addr,
-                         const char *caller_lib_name);
+                         const char *caller_lib_name, sh_recorder_trace_t *trace);
 
 char *sh_recorder_get(uint32_t item_flags);
 void sh_recorder_dump(int fd, uint32_t item_flags);

@@ -57,6 +57,7 @@ void sh_ref_increment_count(sh_ref_t *self) {
 void sh_ref_decrement_count(sh_ref_t *self) {
   int old_count = __atomic_fetch_sub(&self->count, 1, __ATOMIC_RELEASE);
   if (__predict_false(old_count <= 0)) abort();
+  if (old_count == 1) __atomic_thread_fence(__ATOMIC_ACQUIRE);
 }
 
 static int sh_ref_get_count(sh_ref_t *self) {

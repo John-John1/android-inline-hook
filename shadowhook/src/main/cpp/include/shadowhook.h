@@ -35,7 +35,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define SHADOWHOOK_VERSION "2.0.1-rc.10"
+#define SHADOWHOOK_VERSION "2.0.1-rc.15"
 
 #define SHADOWHOOK_ERRNO_OK                     0
 #define SHADOWHOOK_ERRNO_PENDING                1
@@ -198,7 +198,7 @@ void *shadowhook_intercept_sym_name_callback(const char *lib_name, const char *s
 int shadowhook_unintercept(void *stub);
 
 // get operation records
-#define SHADOWHOOK_RECORD_ITEM_ALL             0x7FF  // 0b11111111111
+#define SHADOWHOOK_RECORD_ITEM_ALL             0xFFFFFFFF
 #define SHADOWHOOK_RECORD_ITEM_TIMESTAMP       (1 << 0)
 #define SHADOWHOOK_RECORD_ITEM_CALLER_LIB_NAME (1 << 1)
 #define SHADOWHOOK_RECORD_ITEM_OP              (1 << 2)
@@ -210,6 +210,7 @@ int shadowhook_unintercept(void *stub);
 #define SHADOWHOOK_RECORD_ITEM_ERRNO           (1 << 8)
 #define SHADOWHOOK_RECORD_ITEM_STUB            (1 << 9)
 #define SHADOWHOOK_RECORD_ITEM_FLAGS           (1 << 10)
+#define SHADOWHOOK_RECORD_ITEM_TRACE           (1 << 11)
 char *shadowhook_get_records(uint32_t item_flags);
 void shadowhook_dump_records(int fd, uint32_t item_flags);
 

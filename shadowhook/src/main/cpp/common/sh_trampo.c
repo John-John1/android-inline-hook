@@ -124,7 +124,7 @@ uintptr_t sh_trampo_alloc_between(sh_trampo_mgr_t *mgr, uintptr_t range_low, uin
     trampo = trampo_cur;
     break;
   }
-  if (0 == trampo) abort();
+  if (0 == trampo) abort();  // This shouldn't happen, don't let the problem escalate.
 
 end:
   pthread_mutex_unlock(&mgr->pages_lock);

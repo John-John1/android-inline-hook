@@ -200,16 +200,15 @@ int sh_linker_register_dlopen_post_callback(sh_linker_dlopen_post_t post) {
   addr_info.dli_ssize = 4;
 
   // do hook
-  size_t backup_len = 0;
+  sh_recorder_trace_t trace = SH_RECORDER_TRACE_INITIALIZER;
   int r =
       sh_switch_hook_invisible((uintptr_t)addr_info.dli_saddr, &addr_info, (uintptr_t)sh_linker_proxy_dlopen,
-                               (uintptr_t *)&sh_linker_orig_dlopen, &backup_len);
+                               (uintptr_t *)&sh_linker_orig_dlopen, &trace);
 
   // do record
-  sh_recorder_add_op(r, SH_RECORDER_OP_HOOK_SYM_ADDR, (uintptr_t)addr_info.dli_saddr, SH_LINKER_BASENAME,
-                     sh_linker_dlfcn_name[0], (uintptr_t)sh_linker_proxy_dlopen,
-                     SHADOWHOOK_HOOK_WITH_UNIQUE_MODE, backup_len, UINTPTR_MAX, 0,
-                     SH_LINKER_SHADOWHOOK_BASE_NAME);
+  sh_recorder_add_op(r, SH_RECORDER_OP_HOOK_INVISIBLE_SYM_ADDR, (uintptr_t)addr_info.dli_saddr,
+                     SH_LINKER_BASENAME, sh_linker_dlfcn_name[0], (uintptr_t)sh_linker_proxy_dlopen,
+                     SHADOWHOOK_HOOK_DEFAULT, UINTPTR_MAX, 0, SH_LINKER_SHADOWHOOK_BASE_NAME, &trace);
   if (0 != r) goto end;
 
   // OK
@@ -432,7 +431,7 @@ void shadowhook_proxy_android_linker_soinfo_call_constructors(void *soinfo) {
 #endif
 
   if (__predict_true(0 == scan_tid)) {
-    if (__predict_true(__atomic_load_n(&sh_linker_soinfo_offset_scan_ok, __ATOMIC_RELAXED))) {
+    if (__predict_true(__atomic_load_n(&sh_linker_soinfo_offset_scan_ok, __ATOMIC_ACQUIRE))) {
       if (sh_linker_soinfo_is_loading(soinfo) && !TAILQ_EMPTY(&sh_linker_dl_init_cbs)) {
         // do pre-callbacks
         do_callbacks = true;
@@ -488,7 +487,7 @@ void shadowhook_proxy_android_linker_soinfo_call_destructors(void *soinfo) {
 #endif
 
   if (__predict_true(0 == __atomic_load_n(&sh_linker_soinfo_offset_scan_tid, __ATOMIC_ACQUIRE))) {
-    if (__predict_true(__atomic_load_n(&sh_linker_soinfo_offset_scan_ok, __ATOMIC_RELAXED))) {
+    if (__predict_true(__atomic_load_n(&sh_linker_soinfo_offset_scan_ok, __ATOMIC_ACQUIRE))) {
       if (!TAILQ_EMPTY(&sh_linker_dl_init_cbs)) {
 #if __ANDROID_API__ <= __ANDROID_API_M__
         sh_linker_soinfo_to_dlinfo(soinfo, &dlinfo, buf, sizeof(buf));
@@ -535,8 +534,8 @@ static int sh_linker_hook_call_ctors_dtors(sh_addr_info_t *call_ctors_addr_info,
   int r = -1;
   int r_hook_ctors = INT_MAX;
   int r_hook_dtors = INT_MAX;
-  size_t backup_len_ctors = 0;
-  size_t backup_len_dtors = 0;
+  sh_recorder_trace_t trace_ctors = SH_RECORDER_TRACE_INITIALIZER;
+  sh_recorder_trace_t trace_dtors = SH_RECORDER_TRACE_INITIALIZER;
   int api_level = sh_util_get_api_level();
 
 #if !SH_LINKER_HOOK_WITH_DL_MUTEX
@@ -551,7 +550,7 @@ static int sh_linker_hook_call_ctors_dtors(sh_addr_info_t *call_ctors_addr_info,
   SH_LOG_INFO("linker: hook(invisible) soinfo::call_constructors");
   r_hook_ctors = sh_switch_hook_invisible((uintptr_t)call_ctors_addr_info->dli_saddr, call_ctors_addr_info,
                                           (uintptr_t)shadowhook_proxy_android_linker_soinfo_call_constructors,
-                                          (uintptr_t *)&sh_linker_orig_soinfo_call_ctors, &backup_len_ctors);
+                                          (uintptr_t *)&sh_linker_orig_soinfo_call_ctors, &trace_ctors);
   if (__predict_false(0 != r_hook_ctors)) {
 #if SH_LINKER_HOOK_WITH_DL_MUTEX
     pthread_mutex_unlock(g_dl_mutex);
@@ -563,7 +562,7 @@ static int sh_linker_hook_call_ctors_dtors(sh_addr_info_t *call_ctors_addr_info,
   SH_LOG_INFO("linker: hook(invisible) soinfo::call_destructors");
   r_hook_dtors = sh_switch_hook_invisible((uintptr_t)call_dtors_addr_info->dli_saddr, call_dtors_addr_info,
                                           (uintptr_t)shadowhook_proxy_android_linker_soinfo_call_destructors,
-                                          (uintptr_t *)&sh_linker_orig_soinfo_call_dtors, &backup_len_dtors);
+                                          (uintptr_t *)&sh_linker_orig_soinfo_call_dtors, &trace_dtors);
   if (__predict_false(0 != r_hook_dtors)) {
 #if SH_LINKER_HOOK_WITH_DL_MUTEX
     pthread_mutex_unlock(g_dl_mutex);
@@ -595,20 +594,19 @@ static int sh_linker_hook_call_ctors_dtors(sh_addr_info_t *call_ctors_addr_info,
 end:
   // do records
   if (INT_MAX != r_hook_ctors)
-    sh_recorder_add_op(r_hook_ctors, SH_RECORDER_OP_HOOK_SYM_ADDR, (uintptr_t)call_ctors_addr_info->dli_saddr,
-                       SH_LINKER_BASENAME,
+    sh_recorder_add_op(r_hook_ctors, SH_RECORDER_OP_HOOK_INVISIBLE_SYM_ADDR,
+                       (uintptr_t)call_ctors_addr_info->dli_saddr, SH_LINKER_BASENAME,
                        api_level >= __ANDROID_API_M__ ? SH_LINKER_SYM_CALL_CONSTRUCTORS_M
                                                       : SH_LINKER_SYM_CALL_CONSTRUCTORS_L,
                        (uintptr_t)shadowhook_proxy_android_linker_soinfo_call_constructors,
-                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE, backup_len_ctors, UINTPTR_MAX, 0,
-                       SH_LINKER_SHADOWHOOK_BASE_NAME);
+                       SHADOWHOOK_HOOK_DEFAULT, UINTPTR_MAX, 0, SH_LINKER_SHADOWHOOK_BASE_NAME, &trace_ctors);
   if (INT_MAX != r_hook_dtors)
     sh_recorder_add_op(
-        r_hook_dtors, SH_RECORDER_OP_HOOK_SYM_ADDR, (uintptr_t)call_dtors_addr_info->dli_saddr,
+        r_hook_dtors, SH_RECORDER_OP_HOOK_INVISIBLE_SYM_ADDR, (uintptr_t)call_dtors_addr_info->dli_saddr,
         SH_LINKER_BASENAME,
         api_level >= __ANDROID_API_M__ ? SH_LINKER_SYM_CALL_DESTRUCTORS_M : SH_LINKER_SYM_CALL_DESTRUCTORS_L,
-        (uintptr_t)shadowhook_proxy_android_linker_soinfo_call_destructors, SHADOWHOOK_HOOK_WITH_UNIQUE_MODE,
-        backup_len_dtors, UINTPTR_MAX, 0, SH_LINKER_SHADOWHOOK_BASE_NAME);
+        (uintptr_t)shadowhook_proxy_android_linker_soinfo_call_destructors, SHADOWHOOK_HOOK_DEFAULT,
+        UINTPTR_MAX, 0, SH_LINKER_SHADOWHOOK_BASE_NAME, &trace_dtors);
 
   SH_LOG_INFO("linker: hook ctors and dtors %s", 0 == r ? "OK" : "FAILED");
   return r;
@@ -905,7 +903,10 @@ int sh_linker_get_addr_info_by_handle(sh_addr_info_t *addr_info, void **cached_h
   xdl_info(handle, XDL_DI_DLINFO, (void *)&dlinfo);
 
   // check error
-  if (!sh_linker_check_arch(&dlinfo)) return SHADOWHOOK_ERRNO_ELF_ARCH_MISMATCH;
+  if (!sh_linker_check_arch(&dlinfo)) {
+    xdl_close(handle);
+    return SHADOWHOOK_ERRNO_ELF_ARCH_MISMATCH;
+  }
 
   *cached_handle = handle;
 

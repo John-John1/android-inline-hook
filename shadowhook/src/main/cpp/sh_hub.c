@@ -43,8 +43,8 @@
 #define SH_HUB_TRAMPO_ANON_PAGE_NAME "shadowhook-hub-trampo"
 #define SH_HUB_STACK_ANON_PAGE_NAME  "shadowhook-hub-stack"
 #define SH_HUB_STACK_SIZE            4096  // 4K is enough
-#define SH_HUB_STACK_FRAME_MAX       16    // keep sizeof(sh_hub_stack_t) < 4K
-#define SH_HUB_THREAD_MAX            1024
+#define SH_HUB_STACK_FRAME_MAX       127   // keep sizeof(sh_hub_stack_t) < 4K
+#define SH_HUB_THREAD_MAX            768
 
 #define SH_HUB_FRAME_FLAG_NONE            ((uintptr_t)0)
 #define SH_HUB_FRAME_FLAG_ALLOW_REENTRANT ((uintptr_t)(1 << 0))
@@ -106,8 +106,8 @@ extern void *sh_hub_trampo_template_data __attribute__((visibility("hidden")));
 __attribute__((naked)) static void sh_hub_trampo_template(void) {
 #if defined(__arm__)
   __asm__(
-      // Save parameter registers, LR
-      "push  {r0 - r3, lr}       \n"
+      // Save parameter registers, LR. (keep SP mod 8 = 0)
+      "push  {r0 - r3, r4, lr}   \n"
       "vpush {d0 - d7}           \n"
 
       // Call sh_hub_push_stack()
@@ -119,9 +119,9 @@ __attribute__((naked)) static void sh_hub_trampo_template(void) {
       // Save the hook function's address to IP register
       "mov   ip, r0              \n"
 
-      // Restore parameter registers, LR
+      // Restore parameter registers, LR. (keep SP mod 8 = 0)
       "vpop  {d0 - d7}           \n"
-      "pop   {r0 - r3, lr}       \n"
+      "pop   {r0 - r3, r4, lr}   \n"
 
       // Call hook function
       "bx    ip                  \n"
@@ -182,7 +182,7 @@ extern void *sh_hub_trampo_template_data_ancient __attribute__((visibility("hidd
 __attribute__((naked)) static void sh_hub_trampo_template_ancient(void) {
   __asm__(
       // Save parameter registers, LR
-      "push  { r0 - r3, lr }     \n"
+      "push  { r0 - r3, r4, lr } \n"
 
       // Call sh_hub_push_stack()
       "ldr   r0, .L_hub_ptr_ancient \n"
@@ -194,7 +194,7 @@ __attribute__((naked)) static void sh_hub_trampo_template_ancient(void) {
       "mov   ip, r0              \n"
 
       // Restore parameter registers, LR
-      "pop   { r0 - r3, lr }     \n"
+      "pop   { r0 - r3, r4, lr } \n"
 
       // Call hook function
       "bx    ip                  \n"
@@ -207,6 +207,20 @@ __attribute__((naked)) static void sh_hub_trampo_template_ancient(void) {
       ".word 0;");
 }
 #endif
+
+void sh_hub_record(sh_hub_t *self, sh_recorder_trace_t *trace) {
+  if (!sh_recorder_get_recordable()) return;
+
+  // hub info:
+  // H|<address>|<original>|<proxy function 1>|<proxy function 2>|<......>
+  sh_recorder_trace_append(trace, "H|%" PRIxPTR "|%" PRIxPTR, sh_hub_get_trampo_addr(self), self->orig_addr);
+  sh_hub_proxy_t *proxy;
+  SLIST_FOREACH(proxy, &self->proxies, link) {
+    if (__atomic_load_n(&proxy->enabled, __ATOMIC_RELAXED))
+      sh_recorder_trace_append(trace, "|%" PRIxPTR, (uintptr_t)proxy->func);
+  }
+  sh_recorder_trace_append(trace, ";");
+}
 
 __attribute__((always_inline)) static sh_hub_stack_t *sh_hub_stack_create(void) {
   // get stack from global cache
@@ -254,10 +268,16 @@ static void sh_hub_stack_destroy(void *buf) {
 
 static int sh_hub_init(void) {
   if (__predict_false(0 != pthread_key_create(&sh_hub_stack_tls_key, sh_hub_stack_destroy))) goto err;
-  if (__predict_false(NULL == (sh_hub_stack_cache = malloc(SH_HUB_THREAD_MAX * sizeof(sh_hub_stack_t)))))
+  if (__predict_false(NULL == (sh_hub_stack_cache = malloc(SH_HUB_THREAD_MAX * sizeof(sh_hub_stack_t))))) {
+    pthread_key_delete(sh_hub_stack_tls_key);
     goto err;
-  if (__predict_false(NULL == (sh_hub_stack_cache_used = calloc(SH_HUB_THREAD_MAX, sizeof(uint8_t)))))
+  }
+  if (__predict_false(NULL == (sh_hub_stack_cache_used = calloc(SH_HUB_THREAD_MAX, sizeof(uint8_t))))) {
+    pthread_key_delete(sh_hub_stack_tls_key);
+    free(sh_hub_stack_cache);
+    sh_hub_stack_cache = NULL;
     goto err;
+  }
 
   // init trampo start, code size, data size
   uintptr_t data_start;
@@ -294,16 +314,23 @@ static int sh_hub_lazy_init_once(void) {
   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
   static int init_r = -1;
 
-  if (__predict_true(-1 != init_r)) return init_r;
+  int r = __atomic_load_n(&init_r, __ATOMIC_ACQUIRE);
+  if (__predict_true(-1 != r)) return r;
 
   pthread_mutex_lock(&lock);
-  if (-1 == init_r) init_r = sh_hub_init();
+  r = __atomic_load_n(&init_r, __ATOMIC_RELAXED);
+  if (-1 == r) {
+    r = sh_hub_init();
+    __atomic_store_n(&init_r, r, __ATOMIC_RELEASE);
+  }
   pthread_mutex_unlock(&lock);
 
-  return init_r;
+  return r;
 }
 
 static void *sh_hub_push_stack(sh_hub_t *self, void *return_address) {
+  uintptr_t hub_orig_addr = __atomic_load_n(&self->orig_addr, __ATOMIC_ACQUIRE);
+
   // get stack, create stack
   sh_hub_stack_t *stack = (sh_hub_stack_t *)sh_safe_pthread_getspecific(sh_hub_stack_tls_key);
   if (__predict_false(NULL == stack)) {
@@ -316,7 +343,7 @@ static void *sh_hub_push_stack(sh_hub_t *self, void *return_address) {
   for (size_t i = stack->frames_cnt; i > 0; i--) {
     sh_hub_frame_t *frame = &stack->frames[i - 1];
     if (__predict_false(0 == (frame->flags & SH_HUB_FRAME_FLAG_ALLOW_REENTRANT)) &&
-        __predict_false(frame->orig_addr == self->orig_addr)) {
+        __predict_false(frame->orig_addr == hub_orig_addr)) {
       // recursive call found
       recursive = true;
       break;
@@ -327,15 +354,16 @@ static void *sh_hub_push_stack(sh_hub_t *self, void *return_address) {
   // (does not include the original function)
   if (__predict_true(!recursive)) {
     sh_hub_proxy_t *proxy;
-    SLIST_FOREACH(proxy, &self->proxies, link) {
-      if (__predict_true(proxy->enabled)) {
+    sh_hub_proxy_t *proxies_head = __atomic_load_n(&SLIST_FIRST(&self->proxies), __ATOMIC_ACQUIRE);
+    for (proxy = proxies_head; proxy; proxy = __atomic_load_n(&SLIST_NEXT(proxy, link), __ATOMIC_RELAXED)) {
+      if (__predict_true(__atomic_load_n(&proxy->enabled, __ATOMIC_RELAXED))) {
         // push a new frame for the current proxy
         if (__predict_false(stack->frames_cnt >= SH_HUB_STACK_FRAME_MAX)) goto end;
         stack->frames_cnt++;
         SH_LOG_DEBUG("hub: frames_cnt++ = %zu", stack->frames_cnt);
         sh_hub_frame_t *frame = &stack->frames[stack->frames_cnt - 1];
-        frame->proxies = self->proxies;
-        frame->orig_addr = self->orig_addr;
+        SLIST_FIRST(&frame->proxies) = proxies_head;
+        frame->orig_addr = hub_orig_addr;
         frame->return_address = return_address;
         frame->flags = SH_HUB_FRAME_FLAG_NONE;
 
@@ -349,8 +377,8 @@ static void *sh_hub_push_stack(sh_hub_t *self, void *return_address) {
   // if not found enabled proxy in the proxy-list, or recursive call found,
   // just return the original-function
 end:
-  SH_LOG_DEBUG("hub: push_stack() return orig_addr %p", (void *)self->orig_addr);
-  return (void *)self->orig_addr;
+  SH_LOG_DEBUG("hub: push_stack() return orig_addr %p", (void *)hub_orig_addr);
+  return (void *)hub_orig_addr;
 }
 
 void sh_hub_pop_stack(void *return_address) {
@@ -439,7 +467,7 @@ void sh_hub_destroy(sh_hub_t *self) {
 bool sh_hub_is_proxy_duplicated(sh_hub_t *self, uintptr_t proxy_func) {
   sh_hub_proxy_t *proxy;
   SLIST_FOREACH(proxy, &self->proxies, link) {
-    if (proxy->enabled && proxy->func == (void *)proxy_func) return true;
+    if (__atomic_load_n(&proxy->enabled, __ATOMIC_RELAXED) && proxy->func == (void *)proxy_func) return true;
   }
   return false;
 }
@@ -453,7 +481,8 @@ int sh_hub_add_proxy(sh_hub_t *self, uintptr_t proxy_func) {
   SLIST_FOREACH(proxy, &self->proxies, link) {
     if (proxy->func == (void *)proxy_func) {
       self->proxies_size++;
-      if (!proxy->enabled) __atomic_store_n((bool *)&proxy->enabled, true, __ATOMIC_RELEASE);
+      if (!__atomic_load_n(&proxy->enabled, __ATOMIC_RELAXED))
+        __atomic_store_n(&proxy->enabled, true, __ATOMIC_RELEASE);
       SH_LOG_INFO("hub: add(re-enable) func %" PRIxPTR, proxy_func);
       return 0;
     }
@@ -469,7 +498,7 @@ int sh_hub_add_proxy(sh_hub_t *self, uintptr_t proxy_func) {
   // but: __ATOMIC_RELEASE ensures readers see only fully-constructed item
   self->proxies_size++;
   SLIST_NEXT(proxy, link) = SLIST_FIRST(&self->proxies);
-  __atomic_store_n((uintptr_t *)(&SLIST_FIRST(&self->proxies)), (uintptr_t)proxy, __ATOMIC_RELEASE);
+  __atomic_store_n(&SLIST_FIRST(&self->proxies), proxy, __ATOMIC_RELEASE);
   SH_LOG_INFO("hub: add(new) func %" PRIxPTR, proxy_func);
   return 0;
 }
@@ -477,9 +506,9 @@ int sh_hub_add_proxy(sh_hub_t *self, uintptr_t proxy_func) {
 int sh_hub_del_proxy(sh_hub_t *self, uintptr_t proxy_func) {
   sh_hub_proxy_t *proxy;
   SLIST_FOREACH(proxy, &self->proxies, link) {
-    if (proxy->func == (void *)proxy_func && proxy->enabled) {
+    if (proxy->func == (void *)proxy_func && __atomic_load_n(&proxy->enabled, __ATOMIC_RELAXED)) {
       self->proxies_size--;
-      __atomic_store_n((bool *)&proxy->enabled, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&proxy->enabled, false, __ATOMIC_RELEASE);
       SH_LOG_INFO("hub: del func %" PRIxPTR, proxy_func);
       return 0;
     }
@@ -527,7 +556,7 @@ void *sh_hub_get_prev_func(void *func) {
     if (!found) {
       if (proxy->func == func) found = true;
     } else {
-      if (proxy->enabled) {
+      if (__atomic_load_n(&proxy->enabled, __ATOMIC_ACQUIRE)) {
         break;
       }
     }

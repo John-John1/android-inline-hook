@@ -278,15 +278,15 @@ static void sh_task_do_pending(sh_task_t *task, struct dl_phdr_info *info, void 
   int r = sh_linker_get_addr_info_by_handle(&addr_info, cached_handle, info, task->sym_name);
 
   // do hook or intercept
-  size_t backup_len = 0;
+  sh_recorder_trace_t trace = SH_RECORDER_TRACE_INITIALIZER;
   if (0 == r) {
     task->target_addr = (uintptr_t)addr_info.dli_saddr;
     if (SH_TASK_HOOK == task->type)
       r = sh_switch_hook(task->target_addr, &addr_info, task->typed.hook.new_addr, task->typed.hook.orig_addr,
-                         task->typed.hook.flags, &backup_len);
+                         task->typed.hook.flags, &trace);
     else
       r = sh_switch_intercept(task->target_addr, &addr_info, task->typed.intercept.pre,
-                              task->typed.intercept.data, task->typed.intercept.flags, &backup_len);
+                              task->typed.intercept.data, task->typed.intercept.flags, &trace);
     if (0 != r) task->is_corrupted = true;
   } else {
     task->is_corrupted = true;
@@ -306,12 +306,12 @@ static void sh_task_do_pending(sh_task_t *task, struct dl_phdr_info *info, void 
     new_addr = (uintptr_t)task->typed.intercept.pre;
     flags = (uint32_t)task->typed.intercept.flags;
   }
-  sh_recorder_add_op(r, op, task->target_addr, task->lib_name, task->sym_name, new_addr, flags, backup_len,
-                     (uintptr_t)task, task->caller_addr, NULL);
+  sh_recorder_add_op(r, op, task->target_addr, task->lib_name, task->sym_name, new_addr, flags,
+                     (uintptr_t)task, task->caller_addr, NULL, &trace);
 
   task->is_finished = true;
   sh_task_do_callback(task, r);
-  __atomic_sub_fetch(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
+  __atomic_fetch_sub(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
 
 end:
   sh_ref_unlock(&task->ref);
@@ -390,7 +390,7 @@ static void sh_task_dl_fini_post(struct dl_phdr_info *info, size_t size, void *d
       task->target_addr = 0;
       task->is_finished = false;
       task->is_corrupted = false;
-      __atomic_add_fetch(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
+      __atomic_fetch_add(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
       SH_LOG_INFO("task: reset finished flag for: %s lib_name %s, sym_name %s",
                   SH_TASK_HOOK == task->type ? "hook" : "intercept", task->lib_name, task->sym_name);
     }
@@ -416,7 +416,7 @@ int sh_task_init(void) {
 
 int sh_task_do(sh_task_t *self) {
   int r;
-  size_t backup_len = 0;
+  sh_recorder_trace_t trace = SH_RECORDER_TRACE_INITIALIZER;
   sh_addr_info_t addr_info;
   memset(&addr_info, 0, sizeof(sh_addr_info_t));
 
@@ -432,17 +432,17 @@ int sh_task_do(sh_task_t *self) {
   // hook or intercept by target-address
   if (SH_TASK_HOOK == self->type)
     r = sh_switch_hook(self->target_addr, &addr_info, self->typed.hook.new_addr, self->typed.hook.orig_addr,
-                       self->typed.hook.flags, &backup_len);
+                       self->typed.hook.flags, &trace);
   else
     r = sh_switch_intercept(self->target_addr, &addr_info, self->typed.intercept.pre,
-                            self->typed.intercept.data, self->typed.intercept.flags, &backup_len);
+                            self->typed.intercept.data, self->typed.intercept.flags, &trace);
   self->is_finished = true;
 
 end:
   if (0 == r || SHADOWHOOK_ERRNO_PENDING == r /* "PENDING" is NOT an error */) {
     pthread_mutex_lock(&sh_tasks_lock);
     TAILQ_INSERT_TAIL(&sh_tasks, self, link);
-    if (!self->is_finished) __atomic_add_fetch(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
+    if (!self->is_finished) __atomic_fetch_add(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&sh_tasks_lock);
   }
   sh_linker_free_addr_info(&addr_info);
@@ -490,8 +490,8 @@ end:
   char *sym_name = self->sym_name;
   if (NULL == sym_name) sym_name = self->record_sym_name;
   if (NULL == sym_name) sym_name = "unknown";
-  sh_recorder_add_op(r, op, self->target_addr, lib_name, sym_name, new_addr, flags, backup_len,
-                     (uintptr_t)self, self->caller_addr, NULL);
+  sh_recorder_add_op(r, op, self->target_addr, lib_name, sym_name, new_addr, flags, (uintptr_t)self,
+                     self->caller_addr, NULL, &trace);
   return r;
 }
 
@@ -503,6 +503,8 @@ int sh_task_undo_and_destroy(sh_task_t *self, uintptr_t caller_addr) {
 
   sh_ref_lock(&self->ref);
 
+  sh_recorder_trace_t trace = SH_RECORDER_TRACE_INITIALIZER;
+
   // check task status
   int r;
   if (sh_ref_is_destroyed(&self->ref)) {
@@ -510,7 +512,7 @@ int sh_task_undo_and_destroy(sh_task_t *self, uintptr_t caller_addr) {
     goto end;
   }
   if (!self->is_finished) {
-    __atomic_sub_fetch(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
+    __atomic_fetch_sub(&sh_tasks_unfinished_cnt, 1, __ATOMIC_RELEASE);
     r = SHADOWHOOK_ERRNO_UNHOOK_ON_UNFINISHED;
     goto end;
   }
@@ -521,13 +523,14 @@ int sh_task_undo_and_destroy(sh_task_t *self, uintptr_t caller_addr) {
 
   // do unhook or unintercept
   if (SH_TASK_HOOK == self->type)
-    r = sh_switch_unhook(self->target_addr, self->typed.hook.new_addr, self->typed.hook.flags);
+    r = sh_switch_unhook(self->target_addr, self->typed.hook.new_addr, self->typed.hook.flags, &trace);
   else
-    r = sh_switch_unintercept(self->target_addr, self->typed.intercept.pre, self->typed.intercept.data);
+    r = sh_switch_unintercept(self->target_addr, self->typed.intercept.pre, self->typed.intercept.data,
+                              &trace);
 
 end:
   sh_recorder_add_unop(r, SH_TASK_HOOK == self->type ? SH_RECORDER_OP_UNHOOK : SH_RECORDER_OP_UNINTERCEPT,
-                       (uintptr_t)self, caller_addr, NULL);
+                       (uintptr_t)self, caller_addr, NULL, &trace);
   sh_task_delayed_destroy(self);
   sh_ref_unlock(&self->ref);
   sh_ref_decrement_count(&self->ref);

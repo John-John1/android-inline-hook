@@ -24,6 +24,7 @@
 #include "sh_util.h"
 
 #include <ctype.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -45,7 +46,6 @@ extern __attribute((weak)) unsigned long int getauxval(unsigned long int);
 
 static time_t sh_util_system_uptime;
 static size_t sh_util_page_size;
-static int sh_util_api_level;
 
 #if defined(__arm__) && __ANDROID_API__ < __ANDROID_API_K__
 static int sh_util_trim_cmp(char *haystack, char *needle) {
@@ -105,14 +105,23 @@ end:
   return (api_level > 0) ? api_level : -1;
 }
 
-static void sh_util_init_api_level(void) {
-  sh_util_api_level = android_get_device_api_level();
-  if (__predict_false(sh_util_api_level < 0)) sh_util_api_level = sh_util_get_api_level_from_build_prop();
-  if (__predict_false(sh_util_api_level < __ANDROID_API_J__)) sh_util_api_level = __ANDROID_API_J__;
-}
-
 int sh_util_get_api_level(void) {
-  return sh_util_api_level;
+  static int api_level = -1;
+  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+  int val = __atomic_load_n(&api_level, __ATOMIC_ACQUIRE);
+  if (val < 0) {
+    pthread_mutex_lock(&lock);
+    val = __atomic_load_n(&api_level, __ATOMIC_RELAXED);
+    if (val < 0) {
+      val = android_get_device_api_level();
+      if (val < 0) val = sh_util_get_api_level_from_build_prop();
+      if (val < __ANDROID_API_J__) val = __ANDROID_API_J__;
+      __atomic_store_n(&api_level, val, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&lock);
+  }
+  return val;
 }
 
 #if defined(__arm__)
@@ -177,9 +186,6 @@ void sh_util_init(void) {
   // init pagesize
   sh_util_page_size = (size_t)getpagesize();
 
-  // init api level
-  sh_util_init_api_level();
-
   // init CPU feature
 #if defined(__arm__)
   sh_util_init_arm_cpu_features();
@@ -232,16 +238,37 @@ int sh_util_write_inst(uintptr_t target_addr, void *inst, size_t inst_len) {
     return SHADOWHOOK_ERRNO_MPROT;
 
   SH_SIG_TRY(SIGSEGV, SIGBUS) {
-    if ((4 == inst_len) && (0 == target_addr % 4))
-      __atomic_store_n((uint32_t *)target_addr, *((uint32_t *)inst), __ATOMIC_SEQ_CST);
-    else if ((8 == inst_len) && (0 == target_addr % 8))
-      __atomic_store_n((uint64_t *)target_addr, *((uint64_t *)inst), __ATOMIC_SEQ_CST);
+    if ((4 == inst_len) && (0 == target_addr % 4)) {
+      uint32_t val32;
+      memcpy(&val32, inst, sizeof(val32));
+      __atomic_store_n((uint32_t *)target_addr, val32, __ATOMIC_SEQ_CST);
+    } else if ((4 == inst_len) && (0 == target_addr % 2)) {
+      // better than memcpy
+      uint16_t *dst = (uint16_t *)target_addr;
+      uint16_t *src = (uint16_t *)inst;
+      __atomic_store_n(&dst[0], src[0], __ATOMIC_RELAXED);
+      __atomic_store_n(&dst[1], src[1], __ATOMIC_SEQ_CST);
+    } else if ((8 == inst_len) && (0 == target_addr % 8)) {
+      uint64_t val64;
+      memcpy(&val64, inst, sizeof(val64));
+      __atomic_store_n((uint64_t *)target_addr, val64, __ATOMIC_SEQ_CST);
+    } else if ((8 == inst_len) && (0 == target_addr % 4)) {
+      // better than memcpy
+      uint32_t *dst = (uint32_t *)target_addr;
+      uint32_t *src = (uint32_t *)inst;
+      __atomic_store_n(&dst[0], src[0], __ATOMIC_RELAXED);
+      __atomic_store_n(&dst[1], src[1], __ATOMIC_SEQ_CST);
+    }
 #ifdef __LP64__
-    else if ((16 == inst_len) && (0 == target_addr % 16))
-      __atomic_store_n((__int128 *)target_addr, *((__int128 *)inst), __ATOMIC_SEQ_CST);
+    else if ((16 == inst_len) && (0 == target_addr % 16)) {
+      __int128 val128;
+      memcpy(&val128, inst, sizeof(val128));
+      __atomic_store_n((__int128 *)target_addr, val128, __ATOMIC_SEQ_CST);
+    }
 #endif
-    else
+    else {
       memcpy((void *)target_addr, inst, inst_len);
+    }
 
     sh_util_clear_cache(target_addr, inst_len);
   }

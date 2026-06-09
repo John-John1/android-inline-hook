@@ -43,7 +43,7 @@
 #include "shadowhook.h"
 #include "xdl.h"
 
-#define SH_ELF_TRAMPO_DELAY_SEC 3
+#define SH_ELF_TRAMPO_DELAY_SEC 15
 
 #if defined(__arm__)
 #define SH_ELF_UNIT_SIZE      8
@@ -221,6 +221,22 @@ static void sh_elf_delayed_destroy(sh_elf_t *self) {
   sh_ref_delayed_destroy(&self->ref, &mgr);
 }
 
+static void sh_elf_record(sh_elf_t *self, sh_recorder_trace_t *trace) {
+  if (NULL == trace) return;
+  if (!sh_recorder_get_recordable()) return;
+  if (trace->elf_info_recorded) return;
+  trace->elf_info_recorded = 1;
+
+  // ELF info:
+  // S|<load_bias>|<gap1_start-gap1_end>|<gap2_start-gap2_end>|<......>
+  sh_recorder_trace_append(trace, "S|%" PRIxPTR, (uintptr_t)self->dli_fbase);
+  for (size_t i = 0; i < self->gaps_num; i++)
+    sh_recorder_trace_append(trace, "|%" PRIxPTR "-%" PRIxPTR,
+                             (uintptr_t)self->gaps[i].start - (uintptr_t)self->dli_fbase,
+                             (uintptr_t)self->gaps[i].end - (uintptr_t)self->dli_fbase);
+  sh_recorder_trace_append(trace, ";");
+}
+
 static int sh_elf_get_gaps_from_phdr(sh_elf_t *self, sh_addr_info_t *addr_info) {
   bool elf_loaded_by_kernel = sh_elf_is_loaded_by_kernel((uintptr_t)addr_info->dli_fbase);
 
@@ -264,6 +280,7 @@ static int sh_elf_get_gaps_from_phdr(sh_elf_t *self, sh_addr_info_t *addr_info) 
       gap_start = cur_page_end;
       gap_end = next_page_start;
     }
+    if (gap_end <= gap_start) continue;
     if (gap_end - gap_start < SH_ELF_MIN_ALLOC_SIZE) continue;
 
     SH_LOG_INFO("elf: find phdr gap %" PRIxPTR "-%" PRIxPTR "(load_bias %" PRIxPTR ", %" PRIxPTR "-%" PRIxPTR
@@ -272,12 +289,12 @@ static int sh_elf_get_gaps_from_phdr(sh_elf_t *self, sh_addr_info_t *addr_info) 
                 gap_start - (uintptr_t)addr_info->dli_fbase, gap_end - (uintptr_t)addr_info->dli_fbase);
 
     sh_elf_gap_t *gap = &self->gaps[self->gaps_num];
-    self->gaps_num++;
     gap->start = gap_start;
     gap->end = gap_end;
     gap->trampo_count = (gap->end - gap->start) / SH_ELF_UNIT_SIZE;
-    gap->flags = calloc(1, sizeof(uint32_t) * gap->trampo_count);
+    gap->flags = calloc(gap->trampo_count, sizeof(uint32_t));
     if (NULL == gap->flags) return SHADOWHOOK_ERRNO_OOM;
+    self->gaps_num++;
   }
 
   return 0;
@@ -305,16 +322,17 @@ static void sh_elf_get_gaps_from_useless_symbols(sh_elf_t *self) {
 
       uintptr_t gap_start = SH_UTIL_ALIGN_END(sym_addr, SH_ELF_UNIT_SIZE);
       uintptr_t gap_end = SH_UTIL_ALIGN_START((uintptr_t)sym_addr + sym_sz, SH_ELF_UNIT_SIZE);
+      if (gap_end <= gap_start) continue;
       if (gap_end - gap_start < SH_ELF_MIN_ALLOC_SIZE) continue;
       SH_LOG_INFO("elf: lazy find sym gap %" PRIxPTR "-%" PRIxPTR, gap_start, gap_end);
 
       sh_elf_gap_t *gap = &self->gaps[self->gaps_num];
-      self->gaps_num++;
       gap->start = gap_start;
       gap->end = gap_end;
       gap->trampo_count = (gap->end - gap->start) / SH_ELF_UNIT_SIZE;
-      gap->flags = calloc(1, sizeof(uint32_t) * gap->trampo_count);
+      gap->flags = calloc(gap->trampo_count, sizeof(uint32_t));
       if (NULL == gap->flags) goto end;
+      self->gaps_num++;
     }
   }
 
@@ -356,7 +374,7 @@ static int sh_elf_create(sh_elf_t **self, sh_addr_info_t *addr_info) {
 
   int r = 0;
   if (gaps_max > 0) {
-    (*self)->gaps = calloc(1, sizeof(sh_elf_gap_t) * gaps_max);
+    (*self)->gaps = calloc(gaps_max, sizeof(sh_elf_gap_t));
     if (NULL == (*self)->gaps) {
       r = SHADOWHOOK_ERRNO_OOM;
       goto err;
@@ -495,7 +513,7 @@ static uintptr_t sh_elf_alloc_in_gaps(sh_elf_t *self, size_t size, uintptr_t ran
 }
 
 static int sh_elf_alloc_impl(uintptr_t *addr, size_t size, uintptr_t range_low, uintptr_t range_high,
-                             uintptr_t pc, sh_addr_info_t *addr_info) {
+                             uintptr_t pc, sh_addr_info_t *addr_info, sh_recorder_trace_t *trace) {
   *addr = 0;
   size = SH_UTIL_ALIGN_END(size, SH_ELF_UNIT_SIZE);
   int r;
@@ -523,6 +541,7 @@ static int sh_elf_alloc_impl(uintptr_t *addr, size_t size, uintptr_t range_low, 
     r = SH_ERRNO_INTERNAL_AGAIN;
   } else {
     *addr = sh_elf_alloc_in_gaps(self, size, range_low, range_high);
+    sh_elf_record(self, trace);
     r = 0;  // OK
   }
 
@@ -532,11 +551,11 @@ static int sh_elf_alloc_impl(uintptr_t *addr, size_t size, uintptr_t range_low, 
 }
 
 uintptr_t sh_elf_alloc(size_t size, uintptr_t range_low, uintptr_t range_high, uintptr_t pc,
-                       sh_addr_info_t *addr_info) {
+                       sh_addr_info_t *addr_info, sh_recorder_trace_t *trace) {
   uintptr_t addr;
   int r;
   do {
-    r = sh_elf_alloc_impl(&addr, size, range_low, range_high, pc, addr_info);
+    r = sh_elf_alloc_impl(&addr, size, range_low, range_high, pc, addr_info, trace);
   } while (SH_ERRNO_INTERNAL_AGAIN == r);
   return addr;
 }

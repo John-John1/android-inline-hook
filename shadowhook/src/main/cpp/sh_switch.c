@@ -47,7 +47,7 @@
 #include "shadowhook.h"
 #include "tree.h"
 
-#define SH_SWITCH_DELAY_SEC                    10
+#define SH_SWITCH_DELAY_SEC                    15
 #define SH_SWITCH_GLUE_LAUNCHER_ANON_PAGE_NAME "shadowhook-interceptor-glue-launcher"
 #if defined(__arm__)
 #define SH_SWITCH_GLUE_LAUNCHER_SZ 20
@@ -129,6 +129,57 @@ static pthread_mutex_t sh_switches_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static sh_trampo_mgr_t sh_switch_interceptor_trampo_mgr;
 
+extern void shadowhook_interceptor_glue(void);
+static void sh_switch_record_glue(sh_switch_t *self, sh_recorder_trace_t *trace) {
+  if (!sh_recorder_get_recordable()) return;
+
+  // glue launcher info:
+  // L|<address>|<instructions>
+  sh_recorder_trace_append(trace, "L|%" PRIxPTR "|", self->glue_launcher_addr);
+  for (size_t i = 0; i < SH_SWITCH_GLUE_LAUNCHER_SZ; i++)
+    sh_recorder_trace_append(trace, "%02" PRIx8, ((uint8_t *)self->glue_launcher_addr)[i]);
+  sh_recorder_trace_append(trace, ";");
+
+  // glue info:
+  // G|<address>
+  sh_recorder_trace_append(trace, "G|%" PRIxPTR ";", (uintptr_t)shadowhook_interceptor_glue);
+}
+
+static void sh_switch_record_proxy_and_interceptor(sh_switch_t *self, sh_recorder_trace_t *trace) {
+  if (!sh_recorder_get_recordable()) return;
+
+  if (self->interceptors_size > 0) {
+    // interceptor address info:
+    // I|<address 1>|<address 2>|<......>
+    sh_recorder_trace_append(trace, "I");
+    sh_switch_interceptor_t *interceptor;
+    SLIST_FOREACH(interceptor, &self->interceptors, link) {
+      if (__atomic_load_n(&interceptor->enabled, __ATOMIC_RELAXED))
+        sh_recorder_trace_append(trace, "|%" PRIxPTR, (uintptr_t)interceptor->pre);
+    }
+    sh_recorder_trace_append(trace, ";");
+  }
+
+  if (SH_SWITCH_HOOK_MODE_QUEUE == self->hook_mode) {
+    // proxy address info(queue):
+    // Q|<address 1>|<address 2>|<......>
+    sh_recorder_trace_append(trace, "Q");
+    sh_switch_proxy_t *proxy;
+    TAILQ_FOREACH(proxy, &self->proxies, link) {
+      sh_recorder_trace_append(trace, "|%" PRIxPTR, (uintptr_t)proxy->new_addr);
+    }
+    sh_recorder_trace_append(trace, ";");
+
+    if (NULL != self->hub) {
+      sh_hub_record(self->hub, trace);
+    }
+  } else if (SH_SWITCH_HOOK_MODE_UNIQUE == self->hook_mode) {
+    // proxy address info(unique):
+    // U|<address>
+    sh_recorder_trace_append(trace, "U|%" PRIxPTR ";", (uintptr_t)self->proxy_addr);
+  }
+}
+
 static size_t sh_switch_get_hook_mode(size_t flags) {
   if (flags & SHADOWHOOK_HOOK_WITH_SHARED_MODE) {
     return SHADOWHOOK_HOOK_WITH_SHARED_MODE;
@@ -161,25 +212,35 @@ static void sh_switch_inst_set_orig_addr(uintptr_t addr, void *arg) {
   uintptr_t *orig_addr = (uintptr_t *)*pkg++;
   uintptr_t *orig_addr2 = (uintptr_t *)*pkg;
 
-  if (NULL != orig_addr) __atomic_store_n(orig_addr, addr, __ATOMIC_SEQ_CST);
-  if (NULL != orig_addr2) __atomic_store_n(orig_addr2, addr, __ATOMIC_SEQ_CST);
+  if (NULL != orig_addr) __atomic_store_n(orig_addr, addr, __ATOMIC_RELEASE);
+  if (NULL != orig_addr2) __atomic_store_n(orig_addr2, addr, __ATOMIC_RELEASE);
   if (self->addr_info.is_proc_start) sh_safe_set_orig_addr(self->target_addr, addr);
-  self->resume_addr = addr;
+  __atomic_store_n(&self->resume_addr, addr, __ATOMIC_RELEASE);
 }
 
 static int sh_switch_inst_hook(sh_switch_t *self, uintptr_t new_addr, uintptr_t *orig_addr,
-                               uintptr_t *orig_addr2) {
+                               uintptr_t *orig_addr2, sh_recorder_trace_t *trace) {
   uintptr_t pkg[3] = {(uintptr_t)self, (uintptr_t)orig_addr, (uintptr_t)orig_addr2};
   int r = sh_inst_hook(&self->inst, self->target_addr, &self->addr_info, new_addr,
-                       new_addr == self->glue_launcher_addr, sh_switch_inst_set_orig_addr, pkg);
-  if (0 == r) self->start_addr = new_addr;
+                       new_addr == self->glue_launcher_addr, sh_switch_inst_set_orig_addr, pkg, trace);
+  if (0 == r) {
+    self->start_addr = new_addr;
+    if (new_addr == self->glue_launcher_addr) {
+      sh_switch_record_glue(self, trace);
+    }
+  }
   return r;
 }
 
-static int sh_switch_inst_rehook(sh_switch_t *self, uintptr_t new_addr) {
+static int sh_switch_inst_rehook(sh_switch_t *self, uintptr_t new_addr, sh_recorder_trace_t *trace) {
   int r = sh_inst_rehook(&self->inst, self->target_addr, &self->addr_info, new_addr,
-                         new_addr == self->glue_launcher_addr);
-  if (0 == r) self->start_addr = new_addr;
+                         new_addr == self->glue_launcher_addr, trace);
+  if (0 == r) {
+    self->start_addr = new_addr;
+    if (new_addr == self->glue_launcher_addr) {
+      sh_switch_record_glue(self, trace);
+    }
+  }
   return r;
 }
 
@@ -224,7 +285,8 @@ static int sh_switch_proxy_add(sh_switch_t *self, uintptr_t new_addr, uintptr_t 
       if (0 != (r = sh_hub_create(&self->hub))) return r;
     }
     if (0 != (r = sh_hub_add_proxy(self->hub, new_addr))) return r;
-    if (NULL != orig_addr) *orig_addr = self->resume_addr;
+    if (NULL != orig_addr)
+      __atomic_store_n(orig_addr, __atomic_load_n(&self->resume_addr, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
   }
 
   if (!add_to_hub || !is_hub_in_queue) {
@@ -238,7 +300,8 @@ static int sh_switch_proxy_add(sh_switch_t *self, uintptr_t new_addr, uintptr_t 
     TAILQ_INSERT_TAIL(&self->proxies, proxy, link);
 
     // add at the end of the runtime proxy queue
-    *(proxy->orig_addr) = self->resume_addr;
+    __atomic_store_n(proxy->orig_addr, __atomic_load_n(&self->resume_addr, __ATOMIC_RELAXED),
+                     __ATOMIC_RELAXED);
     sh_switch_proxy_t *prev = TAILQ_PREV(proxy, sh_switch_proxy_queue, link);
     if (NULL != prev) {
       __atomic_store_n(prev->orig_addr, proxy->new_addr, __ATOMIC_RELEASE);
@@ -259,7 +322,8 @@ static int sh_switch_proxy_add_multi(sh_switch_t *self, uintptr_t new_addr, uint
   return sh_switch_proxy_add(self, new_addr, orig_addr, false);
 }
 
-static int sh_switch_proxy_del(sh_switch_t *self, uintptr_t new_addr, bool del_from_hub) {
+static int sh_switch_proxy_del(sh_switch_t *self, uintptr_t new_addr, bool del_from_hub,
+                               sh_recorder_trace_t *trace) {
   int r;
   uintptr_t hub_trampo_addr = (NULL == self->hub ? 0 : sh_hub_get_trampo_addr(self->hub));
   sh_switch_proxy_t *proxy = NULL;
@@ -290,13 +354,14 @@ static int sh_switch_proxy_del(sh_switch_t *self, uintptr_t new_addr, bool del_f
     if (NULL != next) {
       __atomic_store_n(prev->orig_addr, next->new_addr, __ATOMIC_RELEASE);
     } else {
-      __atomic_store_n(prev->orig_addr, self->resume_addr, __ATOMIC_RELEASE);
+      __atomic_store_n(prev->orig_addr, __atomic_load_n(&self->resume_addr, __ATOMIC_RELAXED),
+                       __ATOMIC_RELEASE);
     }
   } else {
     if (NULL != next) {
-      if (self->proxy_addr == self->start_addr) {
+      if (__atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED) == self->start_addr) {
         // prev == NULL && next != NULL && proxy_addr == start_addr
-        if (0 != (r = sh_switch_inst_rehook(self, next->new_addr))) return r;
+        if (0 != (r = sh_switch_inst_rehook(self, next->new_addr, trace))) return r;
       }
       __atomic_store_n(&self->proxy_addr, next->new_addr, __ATOMIC_RELEASE);
     } else {
@@ -311,12 +376,12 @@ static int sh_switch_proxy_del(sh_switch_t *self, uintptr_t new_addr, bool del_f
   return 0;
 }
 
-static int sh_switch_proxy_del_shared(sh_switch_t *self, uintptr_t new_addr) {
-  return sh_switch_proxy_del(self, new_addr, true);
+static int sh_switch_proxy_del_shared(sh_switch_t *self, uintptr_t new_addr, sh_recorder_trace_t *trace) {
+  return sh_switch_proxy_del(self, new_addr, true, trace);
 }
 
-static int sh_switch_proxy_del_multi(sh_switch_t *self, uintptr_t new_addr) {
-  return sh_switch_proxy_del(self, new_addr, false);
+static int sh_switch_proxy_del_multi(sh_switch_t *self, uintptr_t new_addr, sh_recorder_trace_t *trace) {
+  return sh_switch_proxy_del(self, new_addr, false, trace);
 }
 
 void shadowhook_interceptor_caller(void *ctx, shadowhook_cpu_context_t *cpu_context, void **next_hop) {
@@ -329,12 +394,14 @@ void shadowhook_interceptor_caller(void *ctx, shadowhook_cpu_context_t *cpu_cont
 #endif
 
   sh_switch_interceptor_t *interceptor;
-  SLIST_FOREACH(interceptor, &self->interceptors, link) {
-    if (interceptor->enabled) interceptor->pre(cpu_context, interceptor->data);
+  for (interceptor = __atomic_load_n(&SLIST_FIRST(&self->interceptors), __ATOMIC_ACQUIRE); interceptor;
+       interceptor = __atomic_load_n(&SLIST_NEXT(interceptor, link), __ATOMIC_RELAXED)) {
+    if (__atomic_load_n(&interceptor->enabled, __ATOMIC_RELAXED))
+      interceptor->pre(cpu_context, interceptor->data);
   }
 
   uintptr_t proxy_addr = __atomic_load_n(&self->proxy_addr, __ATOMIC_ACQUIRE);
-  *next_hop = (void *)(0 != proxy_addr ? proxy_addr : self->resume_addr);
+  *next_hop = (void *)(0 != proxy_addr ? proxy_addr : __atomic_load_n(&self->resume_addr, __ATOMIC_RELAXED));
 }
 
 static int sh_switch_interceptor_add(sh_switch_t *self, shadowhook_interceptor_t pre, void *data,
@@ -342,18 +409,20 @@ static int sh_switch_interceptor_add(sh_switch_t *self, shadowhook_interceptor_t
   // check repeated interceptor
   sh_switch_interceptor_t *interceptor;
   SLIST_FOREACH(interceptor, &self->interceptors, link) {
-    if (interceptor->pre == pre && interceptor->data == data && interceptor->enabled) {
+    if (interceptor->pre == pre && interceptor->data == data &&
+        __atomic_load_n(&interceptor->enabled, __ATOMIC_RELAXED)) {
       return SHADOWHOOK_ERRNO_INTERCEPT_DUP;
     }
   }
 
   // try to re-enable an exists item
   SLIST_FOREACH(interceptor, &self->interceptors, link) {
-    if (interceptor->pre == pre && interceptor->data == data && !interceptor->enabled) {
+    if (interceptor->pre == pre && interceptor->data == data &&
+        !__atomic_load_n(&interceptor->enabled, __ATOMIC_RELAXED)) {
       interceptor->flags = flags;
       self->intercept_flags_union |= flags;
       self->interceptors_size++;
-      __atomic_store_n((bool *)&interceptor->enabled, true, __ATOMIC_RELEASE);
+      __atomic_store_n(&interceptor->enabled, true, __ATOMIC_RELEASE);
       SH_LOG_INFO("switch-interceptor: size %zu: add(re-enable) pre %" PRIxPTR ", data %" PRIxPTR,
                   self->interceptors_size, (uintptr_t)pre, (uintptr_t)data);
       return 0;
@@ -374,8 +443,7 @@ static int sh_switch_interceptor_add(sh_switch_t *self, shadowhook_interceptor_t
   // equivalent to: SLIST_INSERT_HEAD(&self->interceptors, interceptor, link);
   // but: __ATOMIC_RELEASE ensures readers see only fully-constructed item
   SLIST_NEXT(interceptor, link) = SLIST_FIRST(&self->interceptors);
-  __atomic_store_n((uintptr_t *)(&SLIST_FIRST(&self->interceptors)), (uintptr_t)interceptor,
-                   __ATOMIC_RELEASE);
+  __atomic_store_n(&SLIST_FIRST(&self->interceptors), interceptor, __ATOMIC_RELEASE);
 
   SH_LOG_INFO("switch-interceptor: size %zu: add(new) pre %" PRIxPTR ", data %" PRIxPTR,
               self->interceptors_size, (uintptr_t)pre, (uintptr_t)data);
@@ -388,10 +456,10 @@ static int sh_switch_interceptor_del(sh_switch_t *self, shadowhook_interceptor_t
 
   sh_switch_interceptor_t *interceptor;
   SLIST_FOREACH(interceptor, &self->interceptors, link) {
-    if (interceptor->enabled) {
+    if (__atomic_load_n(&interceptor->enabled, __ATOMIC_RELAXED)) {
       if (interceptor->pre == pre && interceptor->data == data) {
         self->interceptors_size--;
-        __atomic_store_n((bool *)&interceptor->enabled, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&interceptor->enabled, false, __ATOMIC_RELEASE);
         SH_LOG_INFO("switch-interceptor: size %zu: del pre %" PRIxPTR ", data %" PRIxPTR,
                     self->interceptors_size, (uintptr_t)pre, (uintptr_t)data);
         r = 0;
@@ -471,7 +539,7 @@ static int sh_switch_create(sh_switch_t **self, uintptr_t target_addr, size_t ho
 static int sh_switch_create_complete(sh_switch_t *self, sh_addr_info_t *addr_info, uintptr_t new_addr) {
   int r;
   if (0 != (r = sh_linker_copy_addr_info(addr_info, &self->addr_info))) return r;
-  self->proxy_addr = new_addr;
+  __atomic_store_n(&self->proxy_addr, new_addr, __ATOMIC_RELAXED);
   return 0;
 }
 
@@ -507,14 +575,17 @@ end:
 
 static void sh_switch_remove_and_destroy(sh_switch_t *self) {
   pthread_mutex_lock(&sh_switches_lock);
-  RB_REMOVE(sh_switch_tree, &sh_switches, self);
+  sh_switch_t key = {.target_addr = self->target_addr};
+  if (self == RB_FIND(sh_switch_tree, &sh_switches, &key)) {
+    RB_REMOVE(sh_switch_tree, &sh_switches, self);
+  }
   pthread_mutex_unlock(&sh_switches_lock);
 
   sh_switch_delayed_destroy(self);
 }
 
 static int sh_switch_hook_unique(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                                 uintptr_t *orig_addr, size_t *backup_len) {
+                                 uintptr_t *orig_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self;
   int r = sh_switch_find_with_create(&self, target_addr, SH_SWITCH_HOOK_MODE_UNIQUE);
   if (0 != r) return r;
@@ -526,12 +597,15 @@ static int sh_switch_hook_unique(uintptr_t target_addr, sh_addr_info_t *addr_inf
   } else {
     if (!sh_switch_is_hooked(self)) {  // OK
       if (0 != (r = sh_switch_create_complete(self, addr_info, new_addr)) ||
-          0 != (r = sh_switch_inst_hook(self, self->proxy_addr, orig_addr, NULL)))
+          0 != (r = sh_switch_inst_hook(self, __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED), orig_addr,
+                                        NULL, trace)))
         sh_switch_remove_and_destroy(self);
     } else {
-      if (0 == self->proxy_addr) {  // OK
+      if (0 == __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED)) {  // OK
         self->hook_mode = SH_SWITCH_HOOK_MODE_UNIQUE;
-        if (NULL != orig_addr) *orig_addr = self->resume_addr;
+        if (NULL != orig_addr)
+          __atomic_store_n(orig_addr, __atomic_load_n(&self->resume_addr, __ATOMIC_RELAXED),
+                           __ATOMIC_RELAXED);
         __atomic_store_n(&self->proxy_addr, new_addr, __ATOMIC_RELEASE);
       } else {  // error
         if (SH_SWITCH_HOOK_MODE_UNIQUE != self->hook_mode) {
@@ -543,7 +617,10 @@ static int sh_switch_hook_unique(uintptr_t target_addr, sh_addr_info_t *addr_inf
     }
   }
 
-  if (0 == r) *backup_len = self->inst.backup_len;
+  if (0 == r) {
+    sh_switch_record_proxy_and_interceptor(self, trace);
+    sh_recorder_trace_backup_len(trace, self->inst.backup_len);
+  }
 
   sh_ref_unlock(&self->ref);
   sh_ref_decrement_count(&self->ref);
@@ -551,7 +628,7 @@ static int sh_switch_hook_unique(uintptr_t target_addr, sh_addr_info_t *addr_inf
 }
 
 static int sh_switch_hook_multi(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                                uintptr_t *orig_addr, size_t *backup_len) {
+                                uintptr_t *orig_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self;
   int r = sh_switch_find_with_create(&self, target_addr, SH_SWITCH_HOOK_MODE_QUEUE);
   if (0 != r) return r;
@@ -564,7 +641,8 @@ static int sh_switch_hook_multi(uintptr_t target_addr, sh_addr_info_t *addr_info
     if (!sh_switch_is_hooked(self)) {  // OK
       if (0 != (r = sh_switch_create_complete(self, addr_info, new_addr)) ||
           0 != (r = sh_switch_proxy_add_multi(self, new_addr, orig_addr)) ||
-          0 != (r = sh_switch_inst_hook(self, self->proxy_addr, orig_addr, NULL)))
+          0 != (r = sh_switch_inst_hook(self, __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED), orig_addr,
+                                        NULL, trace)))
         sh_switch_remove_and_destroy(self);
     } else {
       if (SH_SWITCH_HOOK_MODE_UNIQUE == self->hook_mode)  // error
@@ -574,7 +652,10 @@ static int sh_switch_hook_multi(uintptr_t target_addr, sh_addr_info_t *addr_info
     }
   }
 
-  if (0 == r) *backup_len = self->inst.backup_len;
+  if (0 == r) {
+    sh_switch_record_proxy_and_interceptor(self, trace);
+    sh_recorder_trace_backup_len(trace, self->inst.backup_len);
+  }
 
   sh_ref_unlock(&self->ref);
   sh_ref_decrement_count(&self->ref);
@@ -582,7 +663,7 @@ static int sh_switch_hook_multi(uintptr_t target_addr, sh_addr_info_t *addr_info
 }
 
 static int sh_switch_hook_shared(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                                 uintptr_t *orig_addr, size_t *backup_len) {
+                                 uintptr_t *orig_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self;
   int r = sh_switch_find_with_create(&self, target_addr, SH_SWITCH_HOOK_MODE_QUEUE);
   if (0 != r) return r;
@@ -595,7 +676,8 @@ static int sh_switch_hook_shared(uintptr_t target_addr, sh_addr_info_t *addr_inf
     if (!sh_switch_is_hooked(self)) {  // OK
       if (0 != (r = sh_switch_create_complete(self, addr_info, new_addr)) ||
           0 != (r = sh_switch_proxy_add_shared(self, new_addr, orig_addr)) ||
-          0 != (r = sh_switch_inst_hook(self, self->proxy_addr, orig_addr, sh_hub_get_orig_addr(self->hub))))
+          0 != (r = sh_switch_inst_hook(self, __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED), orig_addr,
+                                        sh_hub_get_orig_addr(self->hub), trace)))
         sh_switch_remove_and_destroy(self);
     } else {
       if (SH_SWITCH_HOOK_MODE_UNIQUE == self->hook_mode)  // error
@@ -605,7 +687,10 @@ static int sh_switch_hook_shared(uintptr_t target_addr, sh_addr_info_t *addr_inf
     }
   }
 
-  if (0 == r) *backup_len = self->inst.backup_len;
+  if (0 == r) {
+    sh_switch_record_proxy_and_interceptor(self, trace);
+    sh_recorder_trace_backup_len(trace, self->inst.backup_len);
+  }
 
   sh_ref_unlock(&self->ref);
   sh_ref_decrement_count(&self->ref);
@@ -613,24 +698,24 @@ static int sh_switch_hook_shared(uintptr_t target_addr, sh_addr_info_t *addr_inf
 }
 
 int sh_switch_hook(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr, uintptr_t *orig_addr,
-                   size_t flags, size_t *backup_len) {
+                   size_t flags, sh_recorder_trace_t *trace) {
   size_t hook_mode = sh_switch_get_hook_mode(flags);
   char *hook_mode_str;
   int r;
 
   if (SHADOWHOOK_HOOK_WITH_UNIQUE_MODE == hook_mode) {
     do {
-      r = sh_switch_hook_unique(target_addr, addr_info, new_addr, orig_addr, backup_len);
+      r = sh_switch_hook_unique(target_addr, addr_info, new_addr, orig_addr, trace);
     } while (SH_ERRNO_INTERNAL_AGAIN == r);
     hook_mode_str = "UNIQUE";
   } else if (SHADOWHOOK_HOOK_WITH_SHARED_MODE == hook_mode) {
     do {
-      r = sh_switch_hook_shared(target_addr, addr_info, new_addr, orig_addr, backup_len);
+      r = sh_switch_hook_shared(target_addr, addr_info, new_addr, orig_addr, trace);
     } while (SH_ERRNO_INTERNAL_AGAIN == r);
     hook_mode_str = "SHARED";
   } else {  // SHADOWHOOK_HOOK_WITH_MULTI_MODE
     do {
-      r = sh_switch_hook_multi(target_addr, addr_info, new_addr, orig_addr, backup_len);
+      r = sh_switch_hook_multi(target_addr, addr_info, new_addr, orig_addr, trace);
     } while (SH_ERRNO_INTERNAL_AGAIN == r);
     hook_mode_str = "MULTI";
   }
@@ -643,23 +728,24 @@ int sh_switch_hook(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t n
 
 static void sh_switch_inst_set_orig_addr2(uintptr_t addr, void *arg) {
   uintptr_t *orig_addr = (uintptr_t *)arg;
-  if (NULL != orig_addr) __atomic_store_n(orig_addr, addr, __ATOMIC_SEQ_CST);
+  if (NULL != orig_addr) __atomic_store_n(orig_addr, addr, __ATOMIC_RELEASE);
 }
 
 int sh_switch_hook_invisible(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                             uintptr_t *orig_addr, size_t *backup_len) {
+                             uintptr_t *orig_addr, sh_recorder_trace_t *trace) {
   sh_inst_t inst;
   memset(&inst, 0, sizeof(sh_inst_t));
-  int r =
-      sh_inst_hook(&inst, target_addr, addr_info, new_addr, false, sh_switch_inst_set_orig_addr2, orig_addr);
+  int r = sh_inst_hook(&inst, target_addr, addr_info, new_addr, false, sh_switch_inst_set_orig_addr2,
+                       orig_addr, trace);
   if (0 == r)
     SH_LOG_INFO("switch: hook invisible OK: target_addr %" PRIxPTR ", new_addr %" PRIxPTR, target_addr,
                 new_addr);
-  *backup_len = inst.backup_len;
+  sh_recorder_trace_backup_len(trace, inst.backup_len);
+
   return r;
 }
 
-static int sh_switch_unhook_unique(uintptr_t target_addr) {
+static int sh_switch_unhook_unique(uintptr_t target_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self = sh_switch_find(target_addr);
   if (NULL == self) return SHADOWHOOK_ERRNO_UNHOOK_NOTFOUND;
   int r;
@@ -674,6 +760,8 @@ static int sh_switch_unhook_unique(uintptr_t target_addr) {
       if (0 == self->interceptors_size) {
         r = sh_switch_inst_unhook(self);
         sh_switch_remove_and_destroy(self);
+      } else {
+        sh_switch_record_proxy_and_interceptor(self, trace);
       }
     } else {
       r = SHADOWHOOK_ERRNO_MODE_CONFLICT;
@@ -687,7 +775,7 @@ static int sh_switch_unhook_unique(uintptr_t target_addr) {
   return r;
 }
 
-static int sh_switch_unhook_multi(uintptr_t target_addr, uintptr_t new_addr) {
+static int sh_switch_unhook_multi(uintptr_t target_addr, uintptr_t new_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self = sh_switch_find(target_addr);
   if (NULL == self) return SHADOWHOOK_ERRNO_UNHOOK_NOTFOUND;
   int r;
@@ -696,10 +784,12 @@ static int sh_switch_unhook_multi(uintptr_t target_addr, uintptr_t new_addr) {
 
   if (!sh_ref_is_destroyed(&self->ref) && sh_switch_is_hooked(self)) {
     if (SH_SWITCH_HOOK_MODE_QUEUE == self->hook_mode) {
-      if (0 == (r = sh_switch_proxy_del_multi(self, new_addr))) {
+      if (0 == (r = sh_switch_proxy_del_multi(self, new_addr, trace))) {
         if (TAILQ_EMPTY(&self->proxies) && 0 == self->interceptors_size) {
           r = sh_switch_inst_unhook(self);
           sh_switch_remove_and_destroy(self);
+        } else {
+          sh_switch_record_proxy_and_interceptor(self, trace);
         }
       }
     } else {
@@ -714,7 +804,7 @@ static int sh_switch_unhook_multi(uintptr_t target_addr, uintptr_t new_addr) {
   return r;
 }
 
-static int sh_switch_unhook_shared(uintptr_t target_addr, uintptr_t new_addr) {
+static int sh_switch_unhook_shared(uintptr_t target_addr, uintptr_t new_addr, sh_recorder_trace_t *trace) {
   sh_switch_t *self = sh_switch_find(target_addr);
   if (NULL == self) return SHADOWHOOK_ERRNO_UNHOOK_NOTFOUND;
   int r;
@@ -723,10 +813,12 @@ static int sh_switch_unhook_shared(uintptr_t target_addr, uintptr_t new_addr) {
 
   if (!sh_ref_is_destroyed(&self->ref) && sh_switch_is_hooked(self)) {
     if (SH_SWITCH_HOOK_MODE_QUEUE == self->hook_mode) {
-      if (0 == (r = sh_switch_proxy_del_shared(self, new_addr))) {
+      if (0 == (r = sh_switch_proxy_del_shared(self, new_addr, trace))) {
         if (TAILQ_EMPTY(&self->proxies) && 0 == self->interceptors_size) {
           r = sh_switch_inst_unhook(self);
           sh_switch_remove_and_destroy(self);
+        } else {
+          sh_switch_record_proxy_and_interceptor(self, trace);
         }
       }
     } else {
@@ -741,19 +833,19 @@ static int sh_switch_unhook_shared(uintptr_t target_addr, uintptr_t new_addr) {
   return r;
 }
 
-int sh_switch_unhook(uintptr_t target_addr, uintptr_t new_addr, size_t flags) {
+int sh_switch_unhook(uintptr_t target_addr, uintptr_t new_addr, size_t flags, sh_recorder_trace_t *trace) {
   size_t hook_mode = sh_switch_get_hook_mode(flags);
   char *hook_mode_str;
   int r;
 
   if (SHADOWHOOK_HOOK_WITH_UNIQUE_MODE == hook_mode) {
-    r = sh_switch_unhook_unique(target_addr);
+    r = sh_switch_unhook_unique(target_addr, trace);
     hook_mode_str = "UNIQUE";
   } else if (SHADOWHOOK_HOOK_WITH_SHARED_MODE == hook_mode) {
-    r = sh_switch_unhook_shared(target_addr, new_addr);
+    r = sh_switch_unhook_shared(target_addr, new_addr, trace);
     hook_mode_str = "SHARED";
   } else {  // SHADOWHOOK_HOOK_WITH_MULTI_MODE
-    r = sh_switch_unhook_multi(target_addr, new_addr);
+    r = sh_switch_unhook_multi(target_addr, new_addr, trace);
     hook_mode_str = "MULTI";
   }
 
@@ -765,7 +857,7 @@ int sh_switch_unhook(uintptr_t target_addr, uintptr_t new_addr, size_t flags) {
 
 static int sh_switch_intercept_impl(uintptr_t target_addr, sh_addr_info_t *addr_info,
                                     shadowhook_interceptor_t pre, void *data, size_t flags,
-                                    size_t *backup_len) {
+                                    sh_recorder_trace_t *trace) {
   sh_switch_t *self;
   int r = sh_switch_find_with_create(&self, target_addr, SH_SWITCH_HOOK_MODE_NONE);
   if (0 != r) return r;
@@ -779,7 +871,7 @@ static int sh_switch_intercept_impl(uintptr_t target_addr, sh_addr_info_t *addr_
     if (!sh_switch_is_hooked(self)) {  // OK
       if (0 != (r = sh_switch_create_complete(self, addr_info, 0)) ||
           0 != (r = sh_switch_create_glue_launcher(self)) ||
-          0 != (r = sh_switch_inst_hook(self, self->glue_launcher_addr, NULL, NULL))) {
+          0 != (r = sh_switch_inst_hook(self, self->glue_launcher_addr, NULL, NULL, trace))) {
         sh_switch_remove_and_destroy(self);
         goto end;
       }
@@ -788,13 +880,14 @@ static int sh_switch_intercept_impl(uintptr_t target_addr, sh_addr_info_t *addr_
         if (0 != (r = sh_switch_create_glue_launcher(self))) goto end;
       }
       if (self->start_addr != self->glue_launcher_addr) {
-        if (0 != (r = sh_switch_inst_rehook(self, self->glue_launcher_addr))) goto end;
+        if (0 != (r = sh_switch_inst_rehook(self, self->glue_launcher_addr, trace))) goto end;
       }
     }
   }
 
   if (0 != (r = sh_switch_interceptor_add(self, pre, data, flags))) goto end;
-  *backup_len = self->inst.backup_len;
+  sh_switch_record_proxy_and_interceptor(self, trace);
+  sh_recorder_trace_backup_len(trace, self->inst.backup_len);
 
 end:
   sh_ref_unlock(&self->ref);
@@ -803,15 +896,16 @@ end:
 }
 
 int sh_switch_intercept(uintptr_t target_addr, sh_addr_info_t *addr_info, shadowhook_interceptor_t pre,
-                        void *data, size_t flags, size_t *backup_len) {
+                        void *data, size_t flags, sh_recorder_trace_t *trace) {
   int r;
   do {
-    r = sh_switch_intercept_impl(target_addr, addr_info, pre, data, flags, backup_len);
+    r = sh_switch_intercept_impl(target_addr, addr_info, pre, data, flags, trace);
   } while (SH_ERRNO_INTERNAL_AGAIN == r);
   return r;
 }
 
-int sh_switch_unintercept(uintptr_t target_addr, shadowhook_interceptor_t pre, void *data) {
+int sh_switch_unintercept(uintptr_t target_addr, shadowhook_interceptor_t pre, void *data,
+                          sh_recorder_trace_t *trace) {
   sh_switch_t *self = sh_switch_find(target_addr);
   if (NULL == self) return SHADOWHOOK_ERRNO_UNHOOK_NOTFOUND;
   int r;
@@ -821,12 +915,15 @@ int sh_switch_unintercept(uintptr_t target_addr, shadowhook_interceptor_t pre, v
   if (!sh_ref_is_destroyed(&self->ref) && sh_switch_is_hooked(self)) {
     if (0 != (r = sh_switch_interceptor_del(self, pre, data))) goto end;
     if (0 == self->interceptors_size) {
-      if (0 == self->proxy_addr) {
+      if (0 == __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED)) {
         r = sh_switch_inst_unhook(self);
         sh_switch_remove_and_destroy(self);
       } else {
-        r = sh_switch_inst_rehook(self, self->proxy_addr);
+        r = sh_switch_inst_rehook(self, __atomic_load_n(&self->proxy_addr, __ATOMIC_RELAXED), trace);
+        if (0 == r) sh_switch_record_proxy_and_interceptor(self, trace);
       }
+    } else {
+      sh_switch_record_proxy_and_interceptor(self, trace);
     }
   } else {
     r = SHADOWHOOK_ERRNO_UNHOOK_NOTFOUND;

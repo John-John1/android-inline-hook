@@ -44,6 +44,55 @@
 #include "shadowhook.h"
 #include "xdl.h"
 
+static void sh_inst_record(sh_inst_t *self, uintptr_t target_addr, uintptr_t new_addr, bool is_rehook,
+                           bool is_thumb, sh_recorder_trace_t *trace) {
+  if (!sh_recorder_get_recordable()) return;
+
+  // base hook info:
+  // B|<arch>|<hook/rehook>
+  sh_recorder_trace_append(trace, "B|%s|%shook;", is_thumb ? "thumb" : "arm", is_rehook ? "re" : "");
+
+  // target_addr info:
+  // T|<address>|<original_instructions>|<new_instructions>
+  sh_recorder_trace_append(trace, "T|%" PRIxPTR "|", is_thumb ? SH_UTIL_SET_BIT0(target_addr) : target_addr);
+  for (size_t i = 0; i < self->backup_len; i++)
+    sh_recorder_trace_append(trace, "%02" PRIx8, self->backup[i]);
+  if (is_thumb) {
+    for (size_t i = self->backup_len; i < self->rewritten_len; i++)
+      sh_recorder_trace_append(trace, "%02" PRIx8, ((uint8_t *)target_addr)[i]);
+  }
+  sh_recorder_trace_append(trace, "|");
+  for (size_t i = 0; i < self->backup_len; i++)
+    sh_recorder_trace_append(trace, "%02" PRIx8, ((uint8_t *)self->exit)[i]);
+  sh_recorder_trace_append(trace, ";");
+
+  // island exit info:
+  // X|<address>|<type>|<instructions>
+  if (self->island_exit.size > 0) {
+    sh_recorder_trace_append(trace, "X|%" PRIxPTR "|%zu|", self->island_exit.addr, self->island_exit.type);
+    for (size_t i = 0; i < self->island_exit.size; i++)
+      sh_recorder_trace_append(trace, "%02" PRIx8, ((uint8_t *)self->island_exit.addr)[i]);
+    sh_recorder_trace_append(trace, ";");
+  }
+
+  // new address info:
+  // N|<address>
+  sh_recorder_trace_append(trace, "N|%" PRIxPTR ";", new_addr);
+
+  // enter info:
+  // E|<address>|<instructions>
+  sh_recorder_trace_append(trace, "E|%" PRIxPTR "|", is_thumb ? SH_UTIL_SET_BIT0(self->enter) : self->enter);
+  for (size_t i = 0; i < self->enter_len; i++)
+    sh_recorder_trace_append(trace, "%02" PRIx8, ((uint8_t *)self->enter)[i]);
+  sh_recorder_trace_append(trace, ";");
+
+  // resume address info:
+  // R|<address>
+  uintptr_t resume_addr =
+      is_thumb ? SH_UTIL_SET_BIT0(target_addr + self->rewritten_len) : (target_addr + self->backup_len);
+  sh_recorder_trace_append(trace, "R|%" PRIxPTR ";", resume_addr);
+}
+
 static void sh_inst_thumb_get_rewrite_info(sh_inst_t *self, uintptr_t target_addr,
                                            sh_txx_rewrite_info_t *rinfo) {
   memset(rinfo, 0, sizeof(sh_txx_rewrite_info_t));
@@ -207,6 +256,7 @@ static int sh_inst_thumb_rewrite(sh_inst_t *self, uintptr_t target_addr, sh_addr
   uintptr_t resume_addr = SH_UTIL_SET_BIT0(target_addr + self->rewritten_len);
   rinfo.buf_offset += sh_t32_absolute_jump((uint16_t *)(self->enter + rinfo.buf_offset), true, resume_addr);
   sh_util_clear_cache(self->enter, rinfo.buf_offset);
+  self->enter_len = rinfo.buf_offset;
 
   // save original function address
   if (NULL != set_orig_addr) set_orig_addr(SH_UTIL_SET_BIT0(self->enter), set_orig_addr_arg);
@@ -301,7 +351,7 @@ static int sh_inst_thumb_rewrite_with_island(sh_inst_t *self, uintptr_t target_a
 }
 
 static int sh_inst_thumb_reloc_with_island(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info,
-                                           uintptr_t new_addr, bool is_rehook) {
+                                           uintptr_t new_addr, bool is_rehook, sh_recorder_trace_t *trace) {
   int r;
   uintptr_t pc = target_addr + 4;
   sh_island_t new_island_exit;
@@ -311,7 +361,7 @@ static int sh_inst_thumb_reloc_with_island(sh_inst_t *self, uintptr_t target_add
   uintptr_t island_exit_range_low = pc > SH_INST_T32_B_RANGE_LOW ? pc - SH_INST_T32_B_RANGE_LOW : 0;
   uintptr_t island_exit_range_high =
       UINTPTR_MAX - pc > SH_INST_T32_B_RANGE_HIGH ? pc + SH_INST_T32_B_RANGE_HIGH : UINTPTR_MAX;
-  sh_island_alloc(&new_island_exit, 8, island_exit_range_low, island_exit_range_high, pc, addr_info);
+  sh_island_alloc(&new_island_exit, 8, island_exit_range_low, island_exit_range_high, pc, addr_info, trace);
   if (0 == new_island_exit.addr) return SHADOWHOOK_ERRNO_HOOK_ISLAND_EXIT;
 
   // absolute jump to new_addr in island-exit
@@ -330,21 +380,20 @@ static int sh_inst_thumb_reloc_with_island(sh_inst_t *self, uintptr_t target_add
   self->island_exit = new_island_exit;
   memcpy(self->exit, new_exit, self->backup_len);
 
-  SH_LOG_INFO("thumb: %shook (with island) OK. target %" PRIxPTR " -> island-exit %" PRIxPTR
-              " -> new %" PRIxPTR " -> enter %" PRIxPTR " -> resume %" PRIxPTR,
-              is_rehook ? "re-" : "", SH_UTIL_SET_BIT0(target_addr), self->island_exit.addr, new_addr,
-              SH_UTIL_SET_BIT0(self->enter), SH_UTIL_SET_BIT0(target_addr + self->rewritten_len));
+  sh_inst_record(self, target_addr, new_addr, is_rehook, true, trace);
+  SH_LOG_INFO("thumb: %shook (with island) OK. target %" PRIxPTR, is_rehook ? "re" : "", target_addr);
   return 0;
 }
 
 static int sh_inst_thumb_hook_with_island(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info,
                                           uintptr_t new_addr, sh_inst_set_orig_addr_t set_orig_addr,
-                                          void *set_orig_addr_arg) {
+                                          void *set_orig_addr_arg, sh_recorder_trace_t *trace) {
   int r;
   if (0 !=
       (r = sh_inst_thumb_rewrite_with_island(self, target_addr, addr_info, set_orig_addr, set_orig_addr_arg)))
     return r;
-  if (0 != (r = sh_inst_thumb_reloc_with_island(self, target_addr, addr_info, new_addr, false))) return r;
+  if (0 != (r = sh_inst_thumb_reloc_with_island(self, target_addr, addr_info, new_addr, false, trace)))
+    return r;
   return 0;
 }
 #endif
@@ -363,7 +412,7 @@ static int sh_inst_thumb_rewrite_without_island(sh_inst_t *self, uintptr_t targe
 }
 
 static int sh_inst_thumb_reloc_without_island(sh_inst_t *self, uintptr_t target_addr, uintptr_t new_addr,
-                                              bool is_rehook) {
+                                              bool is_rehook, sh_recorder_trace_t *trace) {
   bool is_align4 = (0 == (target_addr % 4));
   uint32_t new_exit[3];
   int r;
@@ -372,21 +421,20 @@ static int sh_inst_thumb_reloc_without_island(sh_inst_t *self, uintptr_t target_
   if (0 != (r = sh_util_write_inst(target_addr, new_exit, self->backup_len))) return r;
   memcpy(self->exit, new_exit, self->backup_len);
 
-  SH_LOG_INFO("thumb: %shook (without island) OK. target %" PRIxPTR " -> new %" PRIxPTR " -> enter %" PRIxPTR
-              " -> resume %" PRIxPTR,
-              is_rehook ? "re-" : "", SH_UTIL_SET_BIT0(target_addr), new_addr, SH_UTIL_SET_BIT0(self->enter),
-              SH_UTIL_SET_BIT0(target_addr + self->rewritten_len));
+  sh_inst_record(self, target_addr, new_addr, is_rehook, true, trace);
+  SH_LOG_INFO("thumb: %shook (without island) OK. target %" PRIxPTR, is_rehook ? "re" : "", target_addr);
   return 0;
 }
 
 static int sh_inst_thumb_hook_without_island(sh_inst_t *self, uintptr_t target_addr,
                                              sh_addr_info_t *addr_info, uintptr_t new_addr,
-                                             sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg) {
+                                             sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg,
+                                             sh_recorder_trace_t *trace) {
   int r;
   if (0 != (r = sh_inst_thumb_rewrite_without_island(self, target_addr, addr_info, set_orig_addr,
                                                      set_orig_addr_arg)))
     return r;
-  if (0 != (r = sh_inst_thumb_reloc_without_island(self, target_addr, new_addr, false))) return r;
+  if (0 != (r = sh_inst_thumb_reloc_without_island(self, target_addr, new_addr, false, trace))) return r;
   return 0;
 }
 #endif
@@ -425,6 +473,7 @@ static int sh_inst_arm_rewrite(sh_inst_t *self, uintptr_t target_addr, sh_addr_i
   uintptr_t resume_addr = target_addr + self->backup_len;
   rinfo.buf_offset += sh_a32_absolute_jump((uint32_t *)(self->enter + rinfo.buf_offset), resume_addr);
   sh_util_clear_cache(self->enter, rinfo.buf_offset);
+  self->enter_len = rinfo.buf_offset;
 
   // save original function address
   if (NULL != set_orig_addr) set_orig_addr(self->enter, set_orig_addr_arg);
@@ -461,7 +510,7 @@ static int sh_inst_arm_rewrite_with_island(sh_inst_t *self, uintptr_t target_add
 }
 
 static int sh_inst_arm_reloc_with_island(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info,
-                                         uintptr_t new_addr, bool is_rehook) {
+                                         uintptr_t new_addr, bool is_rehook, sh_recorder_trace_t *trace) {
   int r;
   uintptr_t pc = target_addr + 8;
   sh_island_t new_island_exit;
@@ -471,7 +520,7 @@ static int sh_inst_arm_reloc_with_island(sh_inst_t *self, uintptr_t target_addr,
   uintptr_t island_exit_range_low = pc > SH_INST_A32_B_RANGE_LOW ? pc - SH_INST_A32_B_RANGE_LOW : 0;
   uintptr_t island_exit_range_high =
       UINTPTR_MAX - pc > SH_INST_A32_B_RANGE_HIGH ? pc + SH_INST_A32_B_RANGE_HIGH : UINTPTR_MAX;
-  sh_island_alloc(&new_island_exit, 8, island_exit_range_low, island_exit_range_high, pc, addr_info);
+  sh_island_alloc(&new_island_exit, 8, island_exit_range_low, island_exit_range_high, pc, addr_info, trace);
   if (0 == new_island_exit.addr) return SHADOWHOOK_ERRNO_HOOK_ISLAND_EXIT;
 
   // absolute jump to new_addr in island-exit
@@ -490,21 +539,20 @@ static int sh_inst_arm_reloc_with_island(sh_inst_t *self, uintptr_t target_addr,
   self->island_exit = new_island_exit;
   memcpy(self->exit, new_exit, self->backup_len);
 
-  SH_LOG_INFO("a32: %shook (with island) OK. target %" PRIxPTR " -> island-exit %" PRIxPTR " -> new %" PRIxPTR
-              " -> enter %" PRIxPTR " -> resume %" PRIxPTR,
-              is_rehook ? "re-" : "", target_addr, self->island_exit.addr, new_addr, self->enter,
-              target_addr + self->backup_len);
+  sh_inst_record(self, target_addr, new_addr, is_rehook, false, trace);
+  SH_LOG_INFO("a32: %shook (with island) OK. target %" PRIxPTR, is_rehook ? "re" : "", target_addr);
   return 0;
 }
 
 static int sh_inst_arm_hook_with_island(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info,
                                         uintptr_t new_addr, sh_inst_set_orig_addr_t set_orig_addr,
-                                        void *set_orig_addr_arg) {
+                                        void *set_orig_addr_arg, sh_recorder_trace_t *trace) {
   int r;
   if (0 !=
       (r = sh_inst_arm_rewrite_with_island(self, target_addr, addr_info, set_orig_addr, set_orig_addr_arg)))
     return r;
-  if (0 != (r = sh_inst_arm_reloc_with_island(self, target_addr, addr_info, new_addr, false))) return r;
+  if (0 != (r = sh_inst_arm_reloc_with_island(self, target_addr, addr_info, new_addr, false, trace)))
+    return r;
   return 0;
 }
 #endif
@@ -536,7 +584,7 @@ static int sh_inst_arm_rewrite_without_island(sh_inst_t *self, uintptr_t target_
 }
 
 static int sh_inst_arm_reloc_without_island(sh_inst_t *self, uintptr_t target_addr, uintptr_t new_addr,
-                                            bool is_rehook) {
+                                            bool is_rehook, sh_recorder_trace_t *trace) {
   uint32_t new_exit[3];
   int r;
 
@@ -544,26 +592,26 @@ static int sh_inst_arm_reloc_without_island(sh_inst_t *self, uintptr_t target_ad
   if (0 != (r = sh_util_write_inst(target_addr, new_exit, self->backup_len))) return r;
   memcpy(self->exit, new_exit, self->backup_len);
 
-  SH_LOG_INFO("a32: %shook (without island) OK. target %" PRIxPTR " -> new %" PRIxPTR " -> enter %" PRIxPTR
-              " -> resume %" PRIxPTR,
-              is_rehook ? "re-" : "", target_addr, new_addr, self->enter, target_addr + self->backup_len);
+  sh_inst_record(self, target_addr, new_addr, is_rehook, false, trace);
+  SH_LOG_INFO("a32: %shook (without island) OK. target %" PRIxPTR, is_rehook ? "re" : "", target_addr);
   return 0;
 }
 
 static int sh_inst_arm_hook_without_island(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info,
                                            uintptr_t new_addr, sh_inst_set_orig_addr_t set_orig_addr,
-                                           void *set_orig_addr_arg) {
+                                           void *set_orig_addr_arg, sh_recorder_trace_t *trace) {
   int r;
   if (0 != (r = sh_inst_arm_rewrite_without_island(self, target_addr, addr_info, set_orig_addr,
                                                    set_orig_addr_arg)))
     return r;
-  if (0 != (r = sh_inst_arm_reloc_without_island(self, target_addr, new_addr, false))) return r;
+  if (0 != (r = sh_inst_arm_reloc_without_island(self, target_addr, new_addr, false, trace))) return r;
   return 0;
 }
 #endif
 
 int sh_inst_hook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                 bool is_to_interceptor, sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg) {
+                 bool is_to_interceptor, sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg,
+                 sh_recorder_trace_t *trace) {
   (void)is_to_interceptor;
 
   self->enter = sh_enter_alloc();
@@ -579,18 +627,18 @@ int sh_inst_hook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_in
     target_addr = SH_UTIL_CLEAR_BIT0(target_addr);
 #ifdef SH_CONFIG_TRY_HOOK_WITH_ISLAND
     if (0 == (r = sh_inst_thumb_hook_with_island(self, target_addr, addr_info, new_addr, set_orig_addr,
-                                                 set_orig_addr_arg)))
+                                                 set_orig_addr_arg, trace)))
       return r;
 #endif
 #ifdef SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND
     if (0 == (r = sh_inst_thumb_hook_without_island(self, target_addr, addr_info, new_addr, set_orig_addr,
-                                                    set_orig_addr_arg)))
+                                                    set_orig_addr_arg, trace)))
       return r;
 #endif
   } else {
 #ifdef SH_CONFIG_TRY_HOOK_WITH_ISLAND
     if (0 == (r = sh_inst_arm_hook_with_island(self, target_addr, addr_info, new_addr, set_orig_addr,
-                                               set_orig_addr_arg)))
+                                               set_orig_addr_arg, trace)))
       return r;
 #endif
 #ifdef SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND
@@ -600,7 +648,7 @@ int sh_inst_hook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_in
         goto err;
     }
     if (0 == (r = sh_inst_arm_hook_without_island(self, target_addr, addr_info, new_addr, set_orig_addr,
-                                                  set_orig_addr_arg)))
+                                                  set_orig_addr_arg, trace)))
       return r;
 #endif
   }
@@ -613,21 +661,21 @@ err:
 }
 
 int sh_inst_rehook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                   bool is_to_interceptor) {
+                   bool is_to_interceptor, sh_recorder_trace_t *trace) {
   (void)is_to_interceptor;
 
   if (SH_UTIL_IS_THUMB(target_addr)) {
     target_addr = SH_UTIL_CLEAR_BIT0(target_addr);
     if (4 == self->backup_len) {
 #ifdef SH_CONFIG_TRY_HOOK_WITH_ISLAND
-      return sh_inst_thumb_reloc_with_island(self, target_addr, addr_info, new_addr, true);
+      return sh_inst_thumb_reloc_with_island(self, target_addr, addr_info, new_addr, true, trace);
 #else
       abort();
 #endif
     } else {
 #ifdef SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND
       (void)addr_info;
-      return sh_inst_thumb_reloc_without_island(self, target_addr, new_addr, true);
+      return sh_inst_thumb_reloc_without_island(self, target_addr, new_addr, true, trace);
 #else
       abort();
 #endif
@@ -635,14 +683,14 @@ int sh_inst_rehook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_
   } else {
     if (4 == self->backup_len) {
 #ifdef SH_CONFIG_TRY_HOOK_WITH_ISLAND
-      return sh_inst_arm_reloc_with_island(self, target_addr, addr_info, new_addr, true);
+      return sh_inst_arm_reloc_with_island(self, target_addr, addr_info, new_addr, true, trace);
 #else
       abort();
 #endif
     } else {
 #ifdef SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND
       (void)addr_info;
-      return sh_inst_arm_reloc_without_island(self, target_addr, new_addr, true);
+      return sh_inst_arm_reloc_without_island(self, target_addr, new_addr, true, trace);
 #else
       abort();
 #endif
@@ -665,7 +713,6 @@ int sh_inst_unhook(sh_inst_t *self, uintptr_t target_addr, uintptr_t load_bias) 
   SH_SIG_EXIT
   if (0 != r) return SHADOWHOOK_ERRNO_UNHOOK_TRAMPO_MISMATCH;
   if (0 != (r = sh_util_write_inst(target_addr, self->backup, self->backup_len))) return r;
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
   // free memory space for island-exit
   if (0 != self->island_exit.addr) sh_island_free(&self->island_exit, load_bias);

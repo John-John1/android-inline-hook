@@ -26,11 +26,12 @@
 #include <stdint.h>
 
 #include "sh_linker.h"
+#include "sh_recorder.h"
 
 // arm:   size = 8
 // arm64: size = 8 or 16 or 20
 uintptr_t sh_elf_alloc(size_t size, uintptr_t range_low, uintptr_t range_high, uintptr_t pc,
-                       sh_addr_info_t *addr_info);
+                       sh_addr_info_t *addr_info, sh_recorder_trace_t *trace);
 void sh_elf_free(uintptr_t addr, size_t size, uintptr_t load_bias);
 
 void sh_elf_cleanup_after_dlclose(uintptr_t load_bias);

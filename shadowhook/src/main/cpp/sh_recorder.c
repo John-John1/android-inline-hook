@@ -69,7 +69,7 @@ typedef struct {
 
 static int sh_recorder_buf_append(sh_recorder_buf_t *buf, size_t step, size_t max, const void *header,
                                   size_t header_sz, const void *body, size_t body_sz) {
-  size_t needs = (header_sz + (NULL != body ? body_sz : 0));
+  size_t needs = (header_sz + ((NULL != body && body_sz > 0) ? body_sz : 0));
   if (needs > step) return -1;
 
   if (buf->cap - buf->sz < needs) {
@@ -82,7 +82,9 @@ static int sh_recorder_buf_append(sh_recorder_buf_t *buf, size_t step, size_t ma
   }
 
   memcpy((void *)((uintptr_t)buf->ptr + buf->sz), header, header_sz);
-  if (NULL != body) memcpy((void *)((uintptr_t)buf->ptr + buf->sz + header_sz), body, body_sz);
+  if (NULL != body && body_sz > 0) {
+    memcpy((void *)((uintptr_t)buf->ptr + buf->sz + header_sz), body, body_sz);
+  }
   buf->sz += needs;
   return 0;
 }
@@ -103,29 +105,29 @@ typedef struct {
 } __attribute__((packed)) sh_recorder_str_header_t;
 // +body: string, including the terminating null byte ('\0')
 
+#define SH_RECORDER_RECORD_COMMON \
+  uint64_t op : 8;                \
+  uint64_t error_number : 8;      \
+  uint64_t ts_ms : 48;            \
+  uintptr_t stub;                 \
+  uint16_t caller_lib_name_idx;   \
+  uint16_t trace_len;
+
 typedef struct {
-  uint64_t op : 8;
-  uint64_t error_number : 8;
-  uint64_t ts_ms : 48;
-  uintptr_t stub;
-  uint16_t caller_lib_name_idx;
-  uint8_t backup_len;
+  SH_RECORDER_RECORD_COMMON
   uint16_t lib_name_idx;
   uint16_t sym_name_idx;
   uintptr_t sym_addr;
   uintptr_t new_addr;
   uint32_t flags;
+  uint8_t backup_len;
 } __attribute__((packed)) sh_recorder_record_op_header_t;
-// no body
+// +body: trace string, including the terminating null byte ('\0')
 
 typedef struct {
-  uint64_t op : 8;
-  uint64_t error_number : 8;
-  uint64_t ts_ms : 48;
-  uintptr_t stub;
-  uint16_t caller_lib_name_idx;
+  SH_RECORDER_RECORD_COMMON
 } __attribute__((packed)) sh_recorder_record_unop_header_t;
-// no body
+// +body: trace string, including the terminating null byte ('\0')
 
 static int sh_recorder_add_str(const char *str, size_t str_len, uint16_t *str_idx) {
   uint16_t idx = 0;
@@ -268,8 +270,8 @@ static void sh_recorder_get_base_name_by_addr(uintptr_t addr, char *base_name, s
 }
 
 int sh_recorder_add_op(int error_number, uint8_t op, uintptr_t sym_addr, const char *lib_name,
-                       const char *sym_name, uintptr_t new_addr, uint32_t flags, size_t backup_len,
-                       uintptr_t stub, uintptr_t caller_addr, const char *caller_lib_name) {
+                       const char *sym_name, uintptr_t new_addr, uint32_t flags, uintptr_t stub,
+                       uintptr_t caller_addr, const char *caller_lib_name, sh_recorder_trace_t *trace) {
   if (!sh_recorder_recordable) return 0;
   if (sh_recorder_error) return -1;
 
@@ -304,15 +306,17 @@ int sh_recorder_add_op(int error_number, uint8_t op, uintptr_t sym_addr, const c
                                            sh_recorder_get_timestamp_ms(),
                                            stub,
                                            caller_lib_name_idx,
-                                           (uint8_t)backup_len,
+                                           (uint16_t)trace->size,
                                            lib_name_idx,
                                            sym_name_idx,
                                            sym_addr,
                                            new_addr,
-                                           flags};
+                                           flags,
+                                           (uint8_t)trace->backup_len};
   pthread_mutex_lock(&sh_recorder_records.lock);
-  int r = sh_recorder_buf_append(&sh_recorder_records, SH_RECORDER_RECORDS_BUF_EXPAND_STEP,
-                                 SH_RECORDER_RECORDS_BUF_MAX, &header, sizeof(header), NULL, 0);
+  int r = sh_recorder_buf_append(
+      &sh_recorder_records, SH_RECORDER_RECORDS_BUF_EXPAND_STEP, SH_RECORDER_RECORDS_BUF_MAX, &header,
+      sizeof(header), 0 == trace->size ? NULL : trace->buf, 0 == trace->size ? 0 : trace->size + 1);
   pthread_mutex_unlock(&sh_recorder_records.lock);
   if (0 != r) goto err;
 
@@ -324,7 +328,7 @@ err:
 }
 
 int sh_recorder_add_unop(int error_number, uint8_t op, uintptr_t stub, uintptr_t caller_addr,
-                         const char *caller_lib_name) {
+                         const char *caller_lib_name, sh_recorder_trace_t *trace) {
   if (!sh_recorder_recordable) return 0;
   if (sh_recorder_error) return -1;
 
@@ -338,11 +342,12 @@ int sh_recorder_add_unop(int error_number, uint8_t op, uintptr_t stub, uintptr_t
   uint16_t caller_lib_name_idx;
   if (0 != sh_recorder_add_str(caller_lib_name, caller_lib_name_len, &caller_lib_name_idx)) goto err;
 
-  sh_recorder_record_unop_header_t header = {op, (uint8_t)error_number, sh_recorder_get_timestamp_ms(), stub,
-                                             caller_lib_name_idx};
+  sh_recorder_record_unop_header_t header = {op,   (uint8_t)error_number, sh_recorder_get_timestamp_ms(),
+                                             stub, caller_lib_name_idx,   (uint16_t)trace->size};
   pthread_mutex_lock(&sh_recorder_records.lock);
-  int r = sh_recorder_buf_append(&sh_recorder_records, SH_RECORDER_RECORDS_BUF_EXPAND_STEP,
-                                 SH_RECORDER_RECORDS_BUF_MAX, &header, sizeof(header), NULL, 0);
+  int r = sh_recorder_buf_append(
+      &sh_recorder_records, SH_RECORDER_RECORDS_BUF_EXPAND_STEP, SH_RECORDER_RECORDS_BUF_MAX, &header,
+      sizeof(header), 0 == trace->size ? NULL : trace->buf, 0 == trace->size ? 0 : trace->size + 1);
   pthread_mutex_unlock(&sh_recorder_records.lock);
   if (0 != r) goto err;
 
@@ -375,6 +380,8 @@ static const char *sh_recorder_get_op_name(uint8_t op) {
       return "intercept_sym_name";
     case SH_RECORDER_OP_UNINTERCEPT:
       return "unintercept";
+    case SH_RECORDER_OP_HOOK_INVISIBLE_SYM_ADDR:
+      return "hook_invisible_sym_addr";
     default:
       return "error";
   }
@@ -392,13 +399,16 @@ static void sh_recorder_output(char **str, int fd, uint32_t item_flags) {
   pthread_mutex_lock(&sh_recorder_records.lock);
   pthread_mutex_lock(&sh_recorder_strings.lock);
 
-  char line[SH_RECORDER_LIB_NAME_MAX * 2 + SH_RECORDER_SYM_NAME_MAX + 256];
+  char line[SH_RECORDER_LIB_NAME_MAX * 2 + SH_RECORDER_SYM_NAME_MAX + 256 + 512];
   size_t line_sz;
   size_t i = 0;
   while (i < sh_recorder_records.sz) {
     line_sz = 0;
     sh_recorder_record_op_header_t *header =
         (sh_recorder_record_op_header_t *)((uintptr_t)sh_recorder_records.ptr + i);
+    bool is_unop = sh_recorder_op_is_unop(header->op);
+    size_t header_len =
+        (is_unop ? sizeof(sh_recorder_record_unop_header_t) : sizeof(sh_recorder_record_op_header_t));
 
     if (item_flags & SHADOWHOOK_RECORD_ITEM_TIMESTAMP)
       line_sz += sh_recorder_format_timestamp_ms(header->ts_ms, line + line_sz, sizeof(line) - line_sz);
@@ -408,41 +418,45 @@ static void sh_recorder_output(char **str, int fd, uint32_t item_flags) {
     if (item_flags & SHADOWHOOK_RECORD_ITEM_OP)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%s,",
                                   sh_recorder_get_op_name(header->op));
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_LIB_NAME) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_LIB_NAME) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%s,",
                                   sh_recorder_find_str(header->lib_name_idx));
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_SYM_NAME) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_SYM_NAME) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%s,",
                                   sh_recorder_find_str(header->sym_name_idx));
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_SYM_ADDR) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_SYM_ADDR) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIxPTR ",", header->sym_addr);
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_NEW_ADDR) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_NEW_ADDR) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIxPTR ",", header->new_addr);
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_BACKUP_LEN) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_BACKUP_LEN) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIu8 ",", header->backup_len);
     if (item_flags & SHADOWHOOK_RECORD_ITEM_ERRNO)
       line_sz +=
           sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIu8 ",", header->error_number);
     if (item_flags & SHADOWHOOK_RECORD_ITEM_STUB)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIxPTR ",", header->stub);
-    if ((item_flags & SHADOWHOOK_RECORD_ITEM_FLAGS) && !sh_recorder_op_is_unop(header->op))
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_FLAGS) && !is_unop)
       line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%" PRIu32 ",", header->flags);
-    line[line_sz - 1] = '\n';
+    if ((item_flags & SHADOWHOOK_RECORD_ITEM_TRACE) && header->trace_len > 0)
+      line_sz += sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "%s,",
+                                  (char *)((uintptr_t)header + header_len));
 
-    if (NULL != str) {
-      // append to string
-      if (0 != sh_recorder_buf_append(&output, SH_RECORDER_OUTPUT_BUF_EXPAND_STEP, SH_RECORDER_OUTPUT_BUF_MAX,
-                                      line, line_sz, NULL, 0)) {
-        sh_recorder_buf_free(&output);
-        break;  // failed
+    if (line_sz > 0) {
+      line[line_sz - 1] = '\n';
+      if (NULL != str) {
+        // append to string
+        if (0 != sh_recorder_buf_append(&output, SH_RECORDER_OUTPUT_BUF_EXPAND_STEP,
+                                        SH_RECORDER_OUTPUT_BUF_MAX, line, line_sz, NULL, 0)) {
+          sh_recorder_buf_free(&output);
+          break;  // failed
+        }
+      } else {
+        // write to FD
+        if (0 != sh_util_write(fd, line, line_sz)) break;  // failed
       }
-    } else {
-      // write to FD
-      if (0 != sh_util_write(fd, line, line_sz)) break;  // failed
     }
 
-    i += (sh_recorder_op_is_unop(header->op) ? sizeof(sh_recorder_record_unop_header_t)
-                                             : sizeof(sh_recorder_record_op_header_t));
+    i += (header_len + (0 == header->trace_len ? 0 : header->trace_len + 1));
   }
 
   pthread_mutex_unlock(&sh_recorder_strings.lock);
@@ -461,18 +475,19 @@ static void sh_recorder_output(char **str, int fd, uint32_t item_flags) {
 
     if (0 == line_sz) line_sz = sh_util_snprintf(line + line_sz, sizeof(line) - line_sz, "error,");
 
-    line[line_sz - 1] = '\n';
-
-    if (NULL != str) {
-      // append to string
-      if (0 != sh_recorder_buf_append(&output, SH_RECORDER_OUTPUT_BUF_EXPAND_STEP, SH_RECORDER_OUTPUT_BUF_MAX,
-                                      line, line_sz, NULL, 0)) {
-        sh_recorder_buf_free(&output);
-        return;  // failed
+    if (line_sz > 0) {
+      line[line_sz - 1] = '\n';
+      if (NULL != str) {
+        // append to string
+        if (0 != sh_recorder_buf_append(&output, SH_RECORDER_OUTPUT_BUF_EXPAND_STEP,
+                                        SH_RECORDER_OUTPUT_BUF_MAX, line, line_sz, NULL, 0)) {
+          sh_recorder_buf_free(&output);
+          return;  // failed
+        }
+      } else {
+        // write to FD
+        if (0 != sh_util_write(fd, line, line_sz)) return;  // failed
       }
-    } else {
-      // write to FD
-      if (0 != sh_util_write(fd, line, line_sz)) return;  // failed
     }
   }
 
@@ -503,6 +518,24 @@ void sh_recorder_dump(int fd, uint32_t item_flags) {
   sh_recorder_output(NULL, fd, item_flags);
 }
 
+void sh_recorder_trace_append(sh_recorder_trace_t *trace, const char *format, ...) {
+  if (trace->size >= sizeof(trace->buf) - 1) return;
+
+  va_list args;
+  va_start(args, format);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+  int r = vsnprintf(trace->buf + trace->size, sizeof(trace->buf) - trace->size, format, args);
+#pragma clang diagnostic pop
+  va_end(args);
+
+  if (r > 0) trace->size += (size_t)r;
+}
+
+void sh_recorder_trace_backup_len(sh_recorder_trace_t *trace, size_t backup_len) {
+  trace->backup_len = backup_len;
+}
+
 #else
 
 bool sh_recorder_get_recordable(void) {
@@ -513,16 +546,17 @@ void sh_recorder_set_recordable(bool recordable) {
   (void)recordable;
 }
 
-int sh_recorder_add_hook(int error_number, bool is_hook_sym_addr, uintptr_t sym_addr, const char *lib_name,
-                         const char *sym_name, uintptr_t new_addr, uint32_t flags, size_t backup_len,
-                         uintptr_t stub, uintptr_t caller_addr) {
-  (void)error_number, (void)is_hook_sym_addr, (void)sym_addr, (void)lib_name, (void)sym_name, (void)new_addr,
-      (void)flags, (void)backup_len, (void)stub, (void)caller_addr;
+int sh_recorder_add_op(int error_number, uint8_t op, uintptr_t sym_addr, const char *lib_name,
+                       const char *sym_name, uintptr_t new_addr, uint32_t flags, uintptr_t stub,
+                       uintptr_t caller_addr, const char *caller_lib_name, sh_recorder_trace_t *trace) {
+  (void)error_number, (void)op, (void)sym_addr, (void)lib_name, (void)sym_name, (void)new_addr, (void)flags,
+      (void)stub, (void)caller_addr, (void)caller_lib_name, (void)trace;
   return 0;
 }
 
-int sh_recorder_add_unhook(int error_number, uintptr_t stub, uintptr_t caller_addr) {
-  (void)error_number, (void)stub, (void)caller_addr;
+int sh_recorder_add_unop(int error_number, uint8_t op, uintptr_t stub, uintptr_t caller_addr,
+                         const char *caller_lib_name, sh_recorder_trace_t *trace) {
+  (void)error_number, (void)op, (void)stub, (void)caller_addr, (void)caller_lib_name, (void)trace;
   return 0;
 }
 
@@ -533,6 +567,14 @@ char *sh_recorder_get(uint32_t item_flags) {
 
 void sh_recorder_dump(int fd, uint32_t item_flags) {
   (void)fd, (void)item_flags;
+}
+
+void sh_recorder_trace_append(sh_recorder_trace_t *trace, const char *format, ...) {
+  (void)trace, (void)format;
+}
+
+void sh_recorder_trace_backup_len(sh_recorder_trace_t *trace, size_t backup_len) {
+  (void)trace, (void)backup_len;
 }
 
 #endif

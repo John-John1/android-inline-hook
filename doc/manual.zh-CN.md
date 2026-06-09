@@ -1621,6 +1621,7 @@ const char *shadowhook_to_errmsg(int error_number);
 > - shadowhook 会在内存中记录 hook / unhook / intercept / unintercept 的操作信息。
 > - 使用者可以随时调用 API 获取这些操作记录。
 > - 你可以在 app 发生崩溃时，获取这些操作记录，把它们和崩溃信息一起保存下来（或者是通过网络投递出去）。
+> - 可以使用 `tools/record_parser.py` 解析操作记录。
 
 ## 操作记录格式
 
@@ -1639,6 +1640,7 @@ const char *shadowhook_to_errmsg(int error_number);
 | 9 | ERRNO | 错误码 |  |
 | 10 | STUB | hook / intercept 返回的 stub | “hook 和 unhook 之间”以及“intercept 和 unintercept 之间”可以通过这个值来配对。 |
 | 11 | FLAGS | flags值 | 操作类型 unhook 和 unintercept 时不含此项。 |
+| 12 | TRACE | 跟踪调试信息 | 用于跟踪 hook 和 intercept 之后的指令执行流向。<br />用于调试 hook 和 intercept 操作。 |
 
 ## Java API
 
@@ -1660,7 +1662,8 @@ public enum RecordItem {
     BACKUP_LEN,
     ERRNO,
     STUB,
-    FLAGS
+    FLAGS,
+    TRACE
 }
 ```
 
@@ -1673,7 +1676,7 @@ public enum RecordItem {
 #include "shadowhook.h"
 
 // 用于指定需要获取哪些操作记录项
-#define SHADOWHOOK_RECORD_ITEM_ALL             0x7FF  // 0b11111111111
+#define SHADOWHOOK_RECORD_ITEM_ALL             0xFFFFFFFF
 #define SHADOWHOOK_RECORD_ITEM_TIMESTAMP       (1 << 0)
 #define SHADOWHOOK_RECORD_ITEM_CALLER_LIB_NAME (1 << 1)
 #define SHADOWHOOK_RECORD_ITEM_OP              (1 << 2)
@@ -1685,6 +1688,7 @@ public enum RecordItem {
 #define SHADOWHOOK_RECORD_ITEM_ERRNO           (1 << 8)
 #define SHADOWHOOK_RECORD_ITEM_STUB            (1 << 9)
 #define SHADOWHOOK_RECORD_ITEM_FLAGS           (1 << 10)
+#define SHADOWHOOK_RECORD_ITEM_TRACE           (1 << 11)
 
 char *shadowhook_get_records(uint32_t item_flags);
 void shadowhook_dump_records(int fd, uint32_t item_flags);
@@ -1694,6 +1698,30 @@ void shadowhook_dump_records(int fd, uint32_t item_flags);
 - `shadowhook_get_records()` API 返回一个用 `malloc()` 分配的 buffer，其中包含了操作记录。**外部使用完后请使用 free()` 释放。**
 - `shadowhook_dump_records()` API 会向 `fd` 参数所指的文件描述符写出操作记录。**这个 API 是异步信号安全的，可以在信号处理函数中调用。**
 
+## 解析操作记录
+
+可以使用 `tools/record_parser.py` 解析操作记录。
+
+- 第一次使用前请先安装 python3 capstone 模块：`python3 -m pip install capstone`
+- `record_parser.py` 加 `-m` 参数，会一起输出该部分对应到 shadowhook 源码中的逻辑的函数/变量/文件名，方便阅读和对照 shadowhook 源码。（默认不显示）
+
+1. 一次解析多条操作记录
+
+先把多条“操作记录”保存在一个文件中（比如 `hook_records.txt`），每一行是一条操作记录，然后执行：
+
+```Shell
+./record_parser.py -i ./hook_records.txt
+```
+
+2. 一次解析一条操作记录
+
+可以直接在命令行输入操作记录，每次只能输入一条：
+
+注意：操作记录请放在双引号中。
+
+```Shell
+./record_parser.py -l "2026-05-29T04:05:14.948+00:00,libunittest.so,intercept_instr_addr,libunittest.so,test_a64_instr_cbz+8,700a4e2b14,700a4a88b8,4,0,b400007075d3deb0,7,B|arm64|hook;T|700a4e2b14|910000b4|99020016;X|70024e3578|0|f0473fa95000005800021fd648c3dfe372000000;N|72e3dfc348;E|72e3ebd940|f0477fa9510000b406000014f0473fa95100005820021fd664354e0270000000f0473fa95000005800025fd650354e0270000000;W|70024e3564|0|f0477fa96ffdff15;e|70024e3550|0|f0477fa971fdff15;R|700a4e2b18;L|72e3dfc348|700000589100005800021fd6ac17460a700000001057d105720000b4;G|700a4617ac;I|700a4a88b8;"
+```
 
 # 已知问题
 

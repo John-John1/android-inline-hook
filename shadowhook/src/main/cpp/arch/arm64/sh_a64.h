@@ -41,7 +41,7 @@ typedef struct {
   sh_addr_info_t *addr_info;
 } sh_a64_rewrite_info_t;
 
-size_t sh_a64_get_rewrite_inst_len(uint32_t inst);
+size_t sh_a64_get_rewrite_inst_len(uint32_t inst, bool use_branch_island);
 size_t sh_a64_rewrite(uint32_t *buf, uint32_t inst, uintptr_t pc, sh_a64_rewrite_info_t *rinfo);
 
 size_t sh_a64_nop(uint32_t *buf);

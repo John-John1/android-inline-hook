@@ -1621,6 +1621,7 @@ const char *shadowhook_to_errmsg(int error_number);
 > - shadowhook records hook/unhook/intercept/unintercept operation information in memory.
 > - Users can call APIs at any time to retrieve these operation records.
 > - You can retrieve these operation records when the app crashes and save them along with the crash information (or deliver them through the network).
+> - You can use `tools/record_parser.py` to parse operation records.
 
 ## Operation Record Format
 
@@ -1639,6 +1640,7 @@ Operation records consist of ASCII visible characters, with each line being one 
 | 9 | ERRNO | Error code |  |
 | 10 | STUB | Stub returned by hook/intercept | "Between hook and unhook" and "between intercept and unintercept" can be paired through this value. |
 | 11 | FLAGS | flags value | This item is not included for operation types unhook and unintercept. |
+| 12 | TRACE | For tracking and debugging | Used to trace the execution flow of instructions after a hook and intercept.<br />Used for debugging hook and intercept operations. |
 
 ## Java API
 
@@ -1660,7 +1662,8 @@ public enum RecordItem {
     BACKUP_LEN,
     ERRNO,
     STUB,
-    FLAGS
+    FLAGS,
+    TRACE
 }
 ```
 
@@ -1673,7 +1676,7 @@ public enum RecordItem {
 #include "shadowhook.h"
 
 // Used to specify which operation record items to retrieve
-#define SHADOWHOOK_RECORD_ITEM_ALL             0x7FF  // 0b11111111111
+#define SHADOWHOOK_RECORD_ITEM_ALL             0xFFFFFFFF
 #define SHADOWHOOK_RECORD_ITEM_TIMESTAMP       (1 << 0)
 #define SHADOWHOOK_RECORD_ITEM_CALLER_LIB_NAME (1 << 1)
 #define SHADOWHOOK_RECORD_ITEM_OP              (1 << 2)
@@ -1685,6 +1688,7 @@ public enum RecordItem {
 #define SHADOWHOOK_RECORD_ITEM_ERRNO           (1 << 8)
 #define SHADOWHOOK_RECORD_ITEM_STUB            (1 << 9)
 #define SHADOWHOOK_RECORD_ITEM_FLAGS           (1 << 10)
+#define SHADOWHOOK_RECORD_ITEM_TRACE           (1 << 11)
 
 char *shadowhook_get_records(uint32_t item_flags);
 void shadowhook_dump_records(int fd, uint32_t item_flags);
@@ -1693,6 +1697,32 @@ void shadowhook_dump_records(int fd, uint32_t item_flags);
 - The `item_flags` parameter is used to specify which operation record items to retrieve. You can use `|` to concatenate the flags defined above; you can also specify `SHADOWHOOK_RECORD_ITEM_ALL` to get **all** operation record items.
 - The `shadowhook_get_records()` API returns a buffer allocated with `malloc()` containing the operation records. **Please use `free()` to release after external use.**
 - The `shadowhook_dump_records()` API writes operation records to the file descriptor specified by the `fd` parameter. **This API is async-signal-safe and can be called in signal handlers.**
+
+## Parsing Operation Records
+
+You can use `tools/record_parser.py` to parse operation records.
+
+- Before first use, please install the python3 capstone module: `python3 -m pip install capstone`
+
+- Adding the `-m` parameter to `record_parser.py` will output the corresponding function/variable/filename in the shadowhook source code, making it easier to read and compare the shadowhook source code. (This is not displayed by default)
+
+1. Parsing Multiple Operation Records at Once
+
+First, save multiple "operation records" in a file (e.g., `hook_records.txt`), with each line representing one operation record, and then execute:
+
+```Shell
+./record_parser.py -i ./hook_records.txt
+```
+
+2. Parse one operation record at a time
+
+You can directly enter the operation record in the command line, only one record can be entered at a time:
+
+Note: Please enclose the operation record in double quotes.
+
+```Shell
+./record_parser.py -l "2026-05-29T04:05:14.948+00:00,libunittest.so,intercept_instr_addr,libunittest.so,test_a64_instr_cbz+8,700a4e2b14,700a4a88b8,4,0,b400007075d3deb0,7,B|arm64|hook;T|700a4e2b14|910000b4|99020016;X|70024e3578|0|f0473fa95000005800021fd648c3dfe372000000;N|72e3dfc348;E|72e3ebd940|f0477fa9510000b406000014f0473fa95100005820021fd664354e0270000000f0473fa95000005800025fd650354e0270000000;W|70024e3564|0|f0477fa96ffdff15;e|70024e3550|0|f0477fa971fdff15;R|700a4e2b18;L|72e3dfc348|700000589100005800021fd6ac17460a700000001057d105720000b4;G|700a4617ac;I|700a4a88b8;"
+```
 
 
 # Known Issues

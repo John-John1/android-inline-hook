@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "sh_linker.h"
+#include "sh_recorder.h"
 
 typedef struct {
   uintptr_t addr;
@@ -37,7 +38,7 @@ void sh_island_init(void);
 
 // range: [range_low, range_high]
 void sh_island_alloc(sh_island_t *self, size_t size, uintptr_t range_low, uintptr_t range_high, uintptr_t pc,
-                     sh_addr_info_t *addr_info);
+                     sh_addr_info_t *addr_info, sh_recorder_trace_t *trace);
 void sh_island_free(sh_island_t *self, uintptr_t load_bias);
 
 void sh_island_free_after_dlclose(sh_island_t *self);

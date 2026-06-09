@@ -90,7 +90,8 @@ static sh_a64_type_t sh_a64_get_type(uint32_t inst) {
     return IGNORED;
 }
 
-size_t sh_a64_get_rewrite_inst_len(uint32_t inst) {
+size_t sh_a64_get_rewrite_inst_len(uint32_t inst, bool use_branch_island) {
+  // without branch island
   static uint8_t map[] = {
       4,   // IGNORED
       20,  // B
@@ -111,7 +112,29 @@ size_t sh_a64_get_rewrite_inst_len(uint32_t inst) {
       24   // TBNZ
   };
 
-  return (size_t)(map[sh_a64_get_type(inst)]);
+  // with branch island
+  static uint8_t map_branch_island[] = {
+      4,   // IGNORED
+      24,  // B
+      32,  // B_COND
+      24,  // BL
+      16,  // ADR
+      16,  // ADRP
+      20,  // LDR_LIT_32
+      20,  // LDR_LIT_64
+      20,  // LDRSW_LIT
+      28,  // PRFM_LIT
+      28,  // LDR_SIMD_LIT_32
+      28,  // LDR_SIMD_LIT_64
+      28,  // LDR_SIMD_LIT_128
+      28,  // CBZ
+      28,  // CBNZ
+      28,  // TBZ
+      28   // TBNZ
+  };
+
+  sh_a64_type_t type = sh_a64_get_type(inst);
+  return (size_t)(use_branch_island ? map_branch_island[type] : map[type]);
 }
 
 static bool sh_a64_is_addr_need_fix(uintptr_t addr, sh_a64_rewrite_info_t *rinfo) {
@@ -146,7 +169,7 @@ static int sh_a64_build_island_rewrite(uintptr_t addr, sh_a64_rewrite_info_t *ri
   uintptr_t island_enter_range_high =
       (UINTPTR_MAX - addr > SH_A64_B_OFFSET_LOW - 4) ? (addr + SH_A64_B_OFFSET_LOW - 4) : UINTPTR_MAX;
   sh_island_alloc(rinfo->island_rewrite, 8, island_enter_range_low, island_enter_range_high, addr,
-                  rinfo->addr_info);
+                  rinfo->addr_info, NULL);
   if (0 == rinfo->island_rewrite->addr) return SHADOWHOOK_ERRNO_HOOK_ISLAND_REWRITE;
 
   // relative jump to "pc + 4" in island-enter
@@ -170,7 +193,7 @@ static size_t sh_a64_rewrite_b(uint32_t *buf, uint32_t inst, uintptr_t pc, sh_a6
   uint64_t addr = pc + imm64;
   addr = sh_a64_fix_addr(addr, rinfo);
 
-  bool use_branch_island = (0 != rinfo->island_rewrite);
+  bool use_branch_island = (NULL != rinfo->island_rewrite);
   if (use_branch_island) {
     if (0 != sh_a64_build_island_rewrite(addr, rinfo)) return 0;  // failed
     addr = rinfo->island_rewrite->addr;
@@ -263,7 +286,7 @@ static size_t sh_a64_rewrite_cb(uint32_t *buf, uint32_t inst, uintptr_t pc, sh_a
   uint64_t addr = pc + offset;
   addr = sh_a64_fix_addr(addr, rinfo);
 
-  bool use_branch_island = (0 != rinfo->island_rewrite);
+  bool use_branch_island = (NULL != rinfo->island_rewrite);
   if (use_branch_island) {
     if (0 != sh_a64_build_island_rewrite(addr, rinfo)) return 0;  // failed
     addr = rinfo->island_rewrite->addr;
@@ -290,7 +313,7 @@ static size_t sh_a64_rewrite_tb(uint32_t *buf, uint32_t inst, uintptr_t pc, sh_a
   uint64_t addr = pc + offset;
   addr = sh_a64_fix_addr(addr, rinfo);
 
-  bool use_branch_island = (0 != rinfo->island_rewrite);
+  bool use_branch_island = (NULL != rinfo->island_rewrite);
   if (use_branch_island) {
     if (0 != sh_a64_build_island_rewrite(addr, rinfo)) return 0;  // failed
     addr = rinfo->island_rewrite->addr;

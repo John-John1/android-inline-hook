@@ -25,7 +25,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "sh_recorder.h"
+
 typedef struct sh_hub sh_hub_t;
+
+void sh_hub_record(sh_hub_t *self, sh_recorder_trace_t *trace);
 
 int sh_hub_create(sh_hub_t **self);
 void sh_hub_destroy(sh_hub_t *self);

@@ -62,21 +62,23 @@ const char *shadowhook_get_version(void) {
 int shadowhook_init(shadowhook_mode_t default_mode, bool debuggable) {
   bool do_init = false;
 
-#define GOTO_END(errnum)            \
-  do {                              \
-    shadowhook_init_errno = errnum; \
-    goto end;                       \
+#define GOTO_END(errnum)                                                \
+  do {                                                                  \
+    __atomic_store_n(&shadowhook_init_errno, errnum, __ATOMIC_RELEASE); \
+    goto end;                                                           \
   } while (0)
 
-  if (__predict_true(SHADOWHOOK_ERRNO_UNINIT == shadowhook_init_errno)) {
+  if (__predict_true(SHADOWHOOK_ERRNO_UNINIT == __atomic_load_n(&shadowhook_init_errno, __ATOMIC_ACQUIRE))) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
-    if (__predict_true(SHADOWHOOK_ERRNO_UNINIT == shadowhook_init_errno)) {
+    if (__predict_true(SHADOWHOOK_ERRNO_UNINIT ==
+                       __atomic_load_n(&shadowhook_init_errno, __ATOMIC_RELAXED))) {
       do_init = true;
       if (__predict_false(sh_errno_is_invalid())) GOTO_END(SHADOWHOOK_ERRNO_INIT_ERRNO);
-      if (__predict_false(shadowhook_disable)) GOTO_END(SHADOWHOOK_ERRNO_DISABLED);
+      if (__predict_false(__atomic_load_n(&shadowhook_disable, __ATOMIC_RELAXED)))
+        GOTO_END(SHADOWHOOK_ERRNO_DISABLED);
       if (__predict_false(default_mode < 0 || default_mode > 2)) GOTO_END(SHADOWHOOK_ERRNO_INVALID_ARG);
-      shadowhook_default_mode = default_mode;
+      __atomic_store_n(&shadowhook_default_mode, default_mode, __ATOMIC_RELEASE);
       sh_log_set_debuggable(debuggable);
       sh_util_init();
       if (__predict_false(0 != bytesig_init(SIGSEGV))) GOTO_END(SHADOWHOOK_ERRNO_INIT_SIGSEGV);
@@ -90,7 +92,7 @@ int shadowhook_init(shadowhook_mode_t default_mode, bool debuggable) {
 
 #undef GOTO_END
 
-      shadowhook_init_errno = SHADOWHOOK_ERRNO_OK;
+      __atomic_store_n(&shadowhook_init_errno, SHADOWHOOK_ERRNO_OK, __ATOMIC_RELEASE);
     }
   end:
     pthread_mutex_unlock(&lock);
@@ -103,18 +105,26 @@ int shadowhook_init(shadowhook_mode_t default_mode, bool debuggable) {
     mode_str = "UNIQUE";
   else
     mode_str = "MULTI";
-  SH_LOG_ALWAYS_SHOW("%s: shadowhook init(default_mode: %s, debuggable: %s), return: %d, real-init: %s",
-                     shadowhook_get_version(), mode_str, debuggable ? "true" : "false", shadowhook_init_errno,
+  int init_errno = __atomic_load_n(&shadowhook_init_errno, __ATOMIC_ACQUIRE);
+  SH_LOG_ALWAYS_SHOW("%s: shadowhook init(default_mode: %s, debuggable: %s), init-errno: %d, real-init: %s",
+                     shadowhook_get_version(), mode_str, debuggable ? "true" : "false", init_errno,
                      do_init ? "yes" : "no");
-  SH_ERRNO_SET_RET_ERRNUM(shadowhook_init_errno);
+  SH_ERRNO_SET_RET_ERRNUM(init_errno);
+}
+
+static int shadowhook_check_avail(void) {
+  if (__predict_false(__atomic_load_n(&shadowhook_disable, __ATOMIC_ACQUIRE)))
+    return SHADOWHOOK_ERRNO_DISABLED;
+
+  return __atomic_load_n(&shadowhook_init_errno, __ATOMIC_ACQUIRE);
 }
 
 int shadowhook_get_init_errno(void) {
-  return shadowhook_init_errno;
+  return __atomic_load_n(&shadowhook_init_errno, __ATOMIC_ACQUIRE);
 }
 
 shadowhook_mode_t shadowhook_get_mode(void) {
-  return shadowhook_default_mode;
+  return __atomic_load_n(&shadowhook_default_mode, __ATOMIC_ACQUIRE);
 }
 
 bool shadowhook_get_debuggable(void) {
@@ -134,12 +144,12 @@ void shadowhook_set_recordable(bool recordable) {
 }
 
 bool shadowhook_get_disable(void) {
-  return shadowhook_disable;
+  return __atomic_load_n(&shadowhook_disable, __ATOMIC_ACQUIRE);
 }
 
 void shadowhook_set_disable(bool disable) {
   SH_LOG_ALWAYS_SHOW("shadowhook set disable = %s", disable ? "TRUE" : "FALSE");
-  shadowhook_disable = disable;
+  __atomic_store_n(&shadowhook_disable, disable, __ATOMIC_RELEASE);
 }
 
 int shadowhook_get_errno(void) {
@@ -185,8 +195,7 @@ static void *shadowhook_hook_addr_impl(const char *api_name, void *target_addr, 
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
   if (__predict_false(!shadowhook_check_record_name_valid(record_sym_name)))
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   // create task
   sh_task_t *task = sh_task_create_hook_by_target_addr(
@@ -198,7 +207,7 @@ static void *shadowhook_hook_addr_impl(const char *api_name, void *target_addr, 
   r = sh_task_do(task);
   if (0 != r) {
     sh_task_destroy(task);
-    GOTO_ERR(r);
+    goto err;
   }
 
   // OK
@@ -266,8 +275,7 @@ static void *shadowhook_hook_sym_name_impl(const char *lib_name, const char *sym
   if (__predict_false(!shadowhook_check_flags_valid(flags))) GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
   if (__predict_false((flags & SHADOWHOOK_HOOK_WITH_MULTI_MODE) && NULL == orig_addr))
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   // create task
   sh_task_t *task =
@@ -279,7 +287,7 @@ static void *shadowhook_hook_sym_name_impl(const char *lib_name, const char *sym
   r = sh_task_do(task);
   if (0 != r && SHADOWHOOK_ERRNO_PENDING != r) {
     sh_task_destroy(task);
-    GOTO_ERR(r);
+    goto err;
   }
 
   // OK
@@ -328,12 +336,11 @@ int shadowhook_unhook(void *stub) {
 
   int r;
   if (__predict_false(NULL == stub)) GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   sh_task_t *task = (sh_task_t *)stub;
   r = sh_task_undo_and_destroy(task, (uintptr_t)caller_addr);
-  if (0 != r) GOTO_ERR(r);
+  if (0 != r) goto err;
 
   // OK
   SH_LOG_INFO("shadowhook: unhook(%p) OK", stub);
@@ -359,8 +366,7 @@ static void *shadowhook_intercept_addr_impl(const char *api_name, void *target_a
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
   if (__predict_false(!shadowhook_check_record_name_valid(record_sym_name)))
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   // create task
   sh_task_t *task =
@@ -372,7 +378,7 @@ static void *shadowhook_intercept_addr_impl(const char *api_name, void *target_a
   r = sh_task_do(task);
   if (0 != r) {
     sh_task_destroy(task);
-    GOTO_ERR(r);
+    goto err;
   }
 
   // OK
@@ -445,8 +451,7 @@ static void *shadowhook_intercept_sym_name_impl(const char *lib_name, const char
   int r;
   if (__predict_false(NULL == lib_name || NULL == sym_name || NULL == pre))
     GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   // create task
   sh_task_t *task = sh_task_create_intercept_by_sym_name(lib_name, sym_name, pre, data, flags, intercepted,
@@ -457,7 +462,7 @@ static void *shadowhook_intercept_sym_name_impl(const char *lib_name, const char
   r = sh_task_do(task);
   if (0 != r && SHADOWHOOK_ERRNO_PENDING != r) {
     sh_task_destroy(task);
-    GOTO_ERR(r);
+    goto err;
   }
 
   // OK
@@ -493,12 +498,11 @@ int shadowhook_unintercept(void *stub) {
 
   int r;
   if (__predict_false(NULL == stub)) GOTO_ERR(SHADOWHOOK_ERRNO_INVALID_ARG);
-  if (__predict_false(shadowhook_disable)) GOTO_ERR(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno)) GOTO_ERR(shadowhook_init_errno);
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) goto err;
 
   sh_task_t *task = (sh_task_t *)stub;
   r = sh_task_undo_and_destroy(task, (uintptr_t)caller_addr);
-  if (0 != r) GOTO_ERR(r);
+  if (0 != r) goto err;
 
   // OK
   SH_LOG_INFO("shadowhook: unintercept(%p) OK", stub);
@@ -510,10 +514,14 @@ err:
 }
 
 char *shadowhook_get_records(uint32_t item_flags) {
+  if (0x3FF == item_flags || 0x7FF == item_flags) item_flags = SHADOWHOOK_RECORD_ITEM_ALL;
+
   return sh_recorder_get(item_flags);
 }
 
 void shadowhook_dump_records(int fd, uint32_t item_flags) {
+  if (0x3FF == item_flags || 0x7FF == item_flags) item_flags = SHADOWHOOK_RECORD_ITEM_ALL;
+
   sh_recorder_dump(fd, item_flags);
 }
 
@@ -557,62 +565,41 @@ void *shadowhook_dlsym_symtab(void *handle, const char *sym_name) {
   return addr;
 }
 
-int shadowhook_register_dl_init_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post, void *data) {
-  if (__predict_false(shadowhook_disable)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno))
-    SH_ERRNO_SET_RET_FAIL(shadowhook_init_errno);
-#ifdef SH_CONFIG_COMPATIBLE_WITH_ARM_ANDROID_4_X
-  if (__predict_false(sh_util_get_api_level() < __ANDROID_API_L__))
-    SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_NOT_SUPPORT);
-#endif
-  if (__predict_false(NULL == pre && NULL == post)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_INVALID_ARG);
-
+static int shadowhook_check_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post) {
   int r;
+  if (__predict_false(NULL == pre && NULL == post)) return SHADOWHOOK_ERRNO_INVALID_ARG;
+#ifdef SH_CONFIG_COMPATIBLE_WITH_ARM_ANDROID_4_X
+  if (__predict_false(sh_util_get_api_level() < __ANDROID_API_L__)) return SHADOWHOOK_ERRNO_NOT_SUPPORT;
+#endif
+  if (__predict_false(0 != (r = shadowhook_check_avail()))) return r;
+
+  return 0;
+}
+
+int shadowhook_register_dl_init_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post, void *data) {
+  int r;
+  if (__predict_false(0 != (r = shadowhook_check_callback(pre, post)))) SH_ERRNO_SET_RET_FAIL(r);
   if (0 != (r = sh_linker_register_dl_init_callback(pre, post, data))) SH_ERRNO_SET_RET_FAIL(r);
   SH_ERRNO_SET_RET_ERRNUM(SHADOWHOOK_ERRNO_OK);
 }
 
 int shadowhook_unregister_dl_init_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post, void *data) {
-  if (__predict_false(shadowhook_disable)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno))
-    SH_ERRNO_SET_RET_FAIL(shadowhook_init_errno);
-#ifdef SH_CONFIG_COMPATIBLE_WITH_ARM_ANDROID_4_X
-  if (__predict_false(sh_util_get_api_level() < __ANDROID_API_L__))
-    SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_NOT_SUPPORT);
-#endif
-  if (__predict_false(NULL == pre && NULL == post)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_INVALID_ARG);
-
   int r;
+  if (__predict_false(0 != (r = shadowhook_check_callback(pre, post)))) SH_ERRNO_SET_RET_FAIL(r);
   if (0 != (r = sh_linker_unregister_dl_init_callback(pre, post, data))) SH_ERRNO_SET_RET_FAIL(r);
   SH_ERRNO_SET_RET_ERRNUM(SHADOWHOOK_ERRNO_OK);
 }
 
 int shadowhook_register_dl_fini_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post, void *data) {
-  if (__predict_false(shadowhook_disable)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno))
-    SH_ERRNO_SET_RET_FAIL(shadowhook_init_errno);
-#ifdef SH_CONFIG_COMPATIBLE_WITH_ARM_ANDROID_4_X
-  if (__predict_false(sh_util_get_api_level() < __ANDROID_API_L__))
-    SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_NOT_SUPPORT);
-#endif
-  if (__predict_false(NULL == pre && NULL == post)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_INVALID_ARG);
-
   int r;
+  if (__predict_false(0 != (r = shadowhook_check_callback(pre, post)))) SH_ERRNO_SET_RET_FAIL(r);
   if (0 != (r = sh_linker_register_dl_fini_callback(pre, post, data))) SH_ERRNO_SET_RET_FAIL(r);
   SH_ERRNO_SET_RET_ERRNUM(SHADOWHOOK_ERRNO_OK);
 }
 
 int shadowhook_unregister_dl_fini_callback(shadowhook_dl_info_t pre, shadowhook_dl_info_t post, void *data) {
-  if (__predict_false(shadowhook_disable)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_DISABLED);
-  if (__predict_false(SHADOWHOOK_ERRNO_OK != shadowhook_init_errno))
-    SH_ERRNO_SET_RET_FAIL(shadowhook_init_errno);
-#ifdef SH_CONFIG_COMPATIBLE_WITH_ARM_ANDROID_4_X
-  if (__predict_false(sh_util_get_api_level() < __ANDROID_API_L__))
-    SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_NOT_SUPPORT);
-#endif
-  if (__predict_false(NULL == pre && NULL == post)) SH_ERRNO_SET_RET_FAIL(SHADOWHOOK_ERRNO_INVALID_ARG);
-
   int r;
+  if (__predict_false(0 != (r = shadowhook_check_callback(pre, post)))) SH_ERRNO_SET_RET_FAIL(r);
   if (0 != (r = sh_linker_unregister_dl_fini_callback(pre, post, data))) SH_ERRNO_SET_RET_FAIL(r);
   SH_ERRNO_SET_RET_ERRNUM(SHADOWHOOK_ERRNO_OK);
 }

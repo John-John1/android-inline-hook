@@ -39,7 +39,7 @@
 // add more island type here ......
 
 #define SH_ISLAND_ANON_PAGE_NAME "shadowhook-island"
-#define SH_ISLAND_DELAY_SEC      3
+#define SH_ISLAND_DELAY_SEC      15
 #if defined(__arm__)
 #define SH_ISLAND_SIZE_MAX 8
 #elif defined(__aarch64__)
@@ -55,7 +55,7 @@ void sh_island_init(void) {
 
 // range: [range_low, range_high]
 void sh_island_alloc(sh_island_t *self, size_t size, uintptr_t range_low, uintptr_t range_high, uintptr_t pc,
-                     sh_addr_info_t *addr_info) {
+                     sh_addr_info_t *addr_info, sh_recorder_trace_t *trace) {
   self->size = size;
 
   // try to allocate via mmap()
@@ -65,7 +65,7 @@ void sh_island_alloc(sh_island_t *self, size_t size, uintptr_t range_low, uintpt
 
   // try to allocate in ELF gaps
   self->type = SH_ISLAND_TYPE_ELF_GAP;
-  self->addr = sh_elf_alloc(size, range_low, range_high, pc, addr_info);
+  self->addr = sh_elf_alloc(size, range_low, range_high, pc, addr_info, trace);
   if (0 != self->addr) goto ok;
 
   return;

@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "sh_linker.h"
+#include "sh_recorder.h"
 #include "shadowhook.h"
 
 void shadowhook_interceptor_caller(void *ctx, shadowhook_cpu_context_t *cpu_context, void **next_hop);
@@ -33,14 +34,15 @@ void shadowhook_interceptor_caller(void *ctx, shadowhook_cpu_context_t *cpu_cont
 void sh_switch_init(void);
 
 int sh_switch_hook(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr, uintptr_t *orig_addr,
-                   size_t flags, size_t *backup_len);
-int sh_switch_unhook(uintptr_t target_addr, uintptr_t new_addr, size_t flags);
+                   size_t flags, sh_recorder_trace_t *trace);
+int sh_switch_unhook(uintptr_t target_addr, uintptr_t new_addr, size_t flags, sh_recorder_trace_t *trace);
 
 int sh_switch_hook_invisible(uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                             uintptr_t *orig_addr, size_t *backup_len);
+                             uintptr_t *orig_addr, sh_recorder_trace_t *trace);
 
 int sh_switch_intercept(uintptr_t target_addr, sh_addr_info_t *addr_info, shadowhook_interceptor_t pre,
-                        void *data, size_t flags, size_t *backup_len);
-int sh_switch_unintercept(uintptr_t target_addr, shadowhook_interceptor_t pre, void *data);
+                        void *data, size_t flags, sh_recorder_trace_t *trace);
+int sh_switch_unintercept(uintptr_t target_addr, shadowhook_interceptor_t pre, void *data,
+                          sh_recorder_trace_t *trace);
 
 void sh_switch_free_after_dlclose(struct dl_phdr_info *info);

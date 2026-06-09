@@ -27,21 +27,24 @@
 
 #include "sh_island.h"
 #include "sh_linker.h"
+#include "sh_recorder.h"
 
 typedef struct {
   uint8_t backup[12];    // max-length = 10 (4-byte alignment)
   size_t backup_len;     // = 4 or 8(arm); = 4 or 8 or 10(thumb)
-  size_t rewritten_len;  // = backup_len(arm); >= backup_len(thumb)
+  size_t rewritten_len;  // ignore(arm); >= backup_len(thumb)
   uint32_t exit[3];      // max-length = 10 (4-byte alignment), length == backup_len
   uintptr_t enter;
+  size_t enter_len;
   sh_island_t island_exit;  // .size = 8(arm & thumb)
 } sh_inst_t;
 
 typedef void (*sh_inst_set_orig_addr_t)(uintptr_t orig_addr, void *arg);
 int sh_inst_hook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                 bool is_to_interceptor, sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg);
+                 bool is_to_interceptor, sh_inst_set_orig_addr_t set_orig_addr, void *set_orig_addr_arg,
+                 sh_recorder_trace_t *trace);
 int sh_inst_rehook(sh_inst_t *self, uintptr_t target_addr, sh_addr_info_t *addr_info, uintptr_t new_addr,
-                   bool is_to_interceptor);
+                   bool is_to_interceptor, sh_recorder_trace_t *trace);
 int sh_inst_unhook(sh_inst_t *self, uintptr_t target_addr, uintptr_t load_bias);
 
 void sh_inst_free_after_dlclose(sh_inst_t *self, uintptr_t target_addr);

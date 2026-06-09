@@ -89,14 +89,14 @@ static void *sh_xdl_open_from_linker(const char *lib_name) {
   return handle;
 }
 
-static void *sh_xdl_open_from_cache(sh_xdl_handle_info_t *info) {
-  struct dl_phdr_info dlinfo = {
-      .dlpi_addr = (ElfW(Addr))__atomic_load_n(&info->dlpi_addr, __ATOMIC_RELAXED),
-      .dlpi_name = __atomic_load_n(&info->dlpi_name, __ATOMIC_RELAXED),
-      .dlpi_phdr = __atomic_load_n(&info->dlpi_phdr, __ATOMIC_RELAXED),
-      .dlpi_phnum = (ElfW(Half))__atomic_load_n(&info->dlpi_phnum, __ATOMIC_RELAXED)};
-  void *handle = xdl_open2(&dlinfo);
+static void *sh_xdl_open_from_cache(sh_xdl_handle_info_t *info, void *dlpi_addr) {
+  struct dl_phdr_info dlinfo;
+  dlinfo.dlpi_addr = (ElfW(Addr))dlpi_addr;
+  dlinfo.dlpi_name = __atomic_load_n(&info->dlpi_name, __ATOMIC_RELAXED);
+  dlinfo.dlpi_phdr = __atomic_load_n(&info->dlpi_phdr, __ATOMIC_RELAXED);
+  dlinfo.dlpi_phnum = (ElfW(Half))__atomic_load_n(&info->dlpi_phnum, __ATOMIC_RELAXED);
 
+  void *handle = xdl_open2(&dlinfo);
   SH_LOG_INFO("xdl: open from cache %s, %s", dlinfo.dlpi_name, NULL == handle ? "failed" : "ok");
   return handle;
 }
@@ -105,23 +105,28 @@ void *sh_xdl_open(const char *lib_name) {
   for (size_t i = 0; i < sizeof(sh_xdl_handle_info_cache) / sizeof(sh_xdl_handle_info_cache[0]); i++) {
     sh_xdl_handle_info_t *info = &sh_xdl_handle_info_cache[i];
     if (sh_xdl_match_pathname(lib_name, info->lib_name)) {
-      if (0 != __atomic_load_n(&info->dlpi_addr, __ATOMIC_ACQUIRE)) {
+      void *dlpi_addr = __atomic_load_n(&info->dlpi_addr, __ATOMIC_ACQUIRE);
+      if (0 != dlpi_addr) {
         // already loaded
-        return sh_xdl_open_from_cache(info);
+        return sh_xdl_open_from_cache(info, dlpi_addr);
       } else {
         void *handle;
         pthread_mutex_lock(&info->lock);
 
-        if (0 != __atomic_load_n(&info->dlpi_addr, __ATOMIC_ACQUIRE)) {
-          handle = sh_xdl_open_from_cache(info);
+        dlpi_addr = __atomic_load_n(&info->dlpi_addr, __ATOMIC_RELAXED);
+        if (0 != dlpi_addr) {
+          // already loaded
+          handle = sh_xdl_open_from_cache(info, dlpi_addr);
         } else {
           handle = sh_xdl_open_from_linker(lib_name);
           if (NULL != handle && SH_XDL_CRASH != handle) {
             xdl_info_t dlinfo;
             xdl_info(handle, XDL_DI_DLINFO, &dlinfo);
-            if (NULL != (info->dlpi_name = strdup(dlinfo.dli_fname))) {
-              info->dlpi_phdr = dlinfo.dlpi_phdr;
-              info->dlpi_phnum = dlinfo.dlpi_phnum;
+            char *name = strdup(dlinfo.dli_fname);
+            if (NULL != name) {
+              __atomic_store_n(&info->dlpi_name, name, __ATOMIC_RELAXED);
+              __atomic_store_n(&info->dlpi_phdr, dlinfo.dlpi_phdr, __ATOMIC_RELAXED);
+              __atomic_store_n(&info->dlpi_phnum, dlinfo.dlpi_phnum, __ATOMIC_RELAXED);
               __atomic_store_n(&info->dlpi_addr, dlinfo.dli_fbase, __ATOMIC_RELEASE);
               SH_LOG_INFO("xdl: save to cache %s", info->dlpi_name);
             }
