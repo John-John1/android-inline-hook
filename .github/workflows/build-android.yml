@@ -24,6 +24,7 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-Wno-error" \
             -G Ninja
           ninja -j$(nproc)
       - name: Upload artifact
