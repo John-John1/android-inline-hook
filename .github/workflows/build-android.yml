@@ -9,8 +9,12 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
-      - name: Install CMake and Ninja
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - name: Install CMake 4.0 and Ninja
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          wget -q https://github.com/Kitware/CMake/releases/download/v4.0.2/cmake-4.0.2-linux-x86_64.tar.gz
+          tar xzf cmake-4.0.2-linux-x86_64.tar.gz
+          echo "$PWD/cmake-4.0.2-linux-x86_64/bin" >> $GITHUB_PATH
       - name: Build ShadowHook
         run: |
           mkdir build && cd build
